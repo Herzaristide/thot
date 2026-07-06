@@ -1,0 +1,12 @@
+# Env
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Données locales
+data/
+*.log

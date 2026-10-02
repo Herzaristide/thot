@@ -1,0 +1,18 @@
+# Espace de travail uv : un seul environnement (.venv) et un seul uv.lock pour
+# les paquets Python du dépôt.
+[tool.uv.workspace]
+members = ["core", "ingest", "corpus-api"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# HTML de test sur une ligne
+"*/tests/*" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["thot_core", "thot_ingest", "thot_api"]

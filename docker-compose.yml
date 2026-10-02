@@ -11,14 +11,99 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # Les scripts de ce dossier sont exécutés au premier démarrage
-      # (base vide uniquement) par ordre alphabétique.
-      - ./db/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-thot} -d ${POSTGRES_DB:-thot}"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # Applique les migrations de db/migrations/ (dbmate) puis s'arrête.
+  # Les autres services qui écrivent en base attendent sa fin.
+  migrate:
+    image: ghcr.io/amacneil/dbmate:2.35.1
+    container_name: thot_migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-thot}:${POSTGRES_PASSWORD:-thot}@postgres:5432/${POSTGRES_DB:-thot}?sslmode=disable
+      DBMATE_MIGRATIONS_DIR: /db/migrations
+      DBMATE_NO_DUMP_SCHEMA: "true"
+    command: ["--wait", "up"]
+    volumes:
+      - ./db/migrations:/db/migrations:ro
+    restart: "no"
+
+  # Crée les bases des autres services sur le même serveur Postgres, puis
+  # s'arrête (idempotent ; initdb.d ne tourne que sur un volume vide) :
+  #   keycloak : comptes, sessions, realm `thot`
+  #   reader   : données des lecteurs de la liseuse (préférences, progression…)
+  databases:
+    image: postgres:17-alpine
+    container_name: thot_databases
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-thot}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-thot}
+      PGDATABASE: ${POSTGRES_DB:-thot}
+    command:
+      - sh
+      - -c
+      - |
+        for db in keycloak reader; do
+          psql -tAc "SELECT 1 FROM pg_database WHERE datname = '$$db'" | grep -q 1 \
+            || psql -c "CREATE DATABASE $$db"
+        done
+    restart: "no"
+
+  # Identité (OIDC). Realm `thot` importé au premier démarrage depuis
+  # keycloak/import/ (ignoré ensuite s'il existe déjà).
+  #   console : http://localhost:8080/admin  (KEYCLOAK_ADMIN / KEYCLOAK_ADMIN_PASSWORD)
+  # Les jetons portent toujours l'émetteur public (KEYCLOAK_URL) ; les autres
+  # conteneurs joignent Keycloak par http://keycloak:8080 (backchannel dynamique).
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8
+    container_name: thot_keycloak
+    restart: unless-stopped
+    command: ["start-dev", "--import-realm"]
+    depends_on:
+      databases:
+        condition: service_completed_successfully
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: ${POSTGRES_USER:-thot}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-thot}
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-change-me}
+      KC_HOSTNAME: ${KEYCLOAK_URL:-http://localhost:8080}
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HEALTH_ENABLED: "true"
+      # Valeurs injectées dans keycloak/import/thot-realm.json
+      THOT_READER_URL: ${READER_URL:-http://localhost:3000}
+      THOT_READER_CLIENT_SECRET: ${READER_CLIENT_SECRET:-dev-reader-secret}
+      THOT_DEV_USER_PASSWORD: ${KEYCLOAK_DEV_USER_PASSWORD:-lecteur}
+    ports:
+      - "${KEYCLOAK_PORT:-8080}:8080"
+    volumes:
+      - ./keycloak/import:/opt/keycloak/data/import:ro
+      # Thème de connexion « thot » (couleurs de la liseuse)
+      - ./keycloak/themes/thot:/opt/keycloak/themes/thot:ro
+    healthcheck:
+      # Pas de curl dans l'image : requête HTTP à la main sur le port de gestion
+      test:
+        - CMD-SHELL
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          grep -q '"status": "UP"' <&3
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 10
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -54,20 +139,6 @@ services:
       timeout: 5s
       retries: 5
 
-  minio-init:
-    image: minio/mc:latest
-    container_name: thot_minio_init
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-thot} ${MINIO_ROOT_PASSWORD:-change-me} &&
-      mc mb --ignore-existing local/${MINIO_BOOKS_BUCKET:-books} &&
-      mc mb --ignore-existing local/${MINIO_AVATARS_BUCKET:-avatars}
-      "
-    restart: "no"
-
   pgadmin:
     image: dpage/pgadmin4:latest
     container_name: thot_pgadmin
@@ -87,8 +158,139 @@ services:
       # une fois dans l'UI, non stocké en clair dans ce dépôt).
       - ./pgadmin/servers.json:/pgadmin4/servers.json:ro
 
+  # Pipeline d'ingestion (commande à la demande, pas un service permanent) :
+  #   docker compose run --rm ingest check
+  #   docker compose run --rm ingest extract
+  # Avec le GPU (NVIDIA Container Toolkit requis côté hôte) :
+  #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml run --rm ingest index run <collection>
+  ingest:
+    build:
+      context: .
+      dockerfile: ingest/Dockerfile
+    image: thot-ingest
+    profiles: ["ingest"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-thot}:${POSTGRES_PASSWORD:-thot}@postgres:5432/${POSTGRES_DB:-thot}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-chunks}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}
+      VECTOR_SIZE: ${VECTOR_SIZE:-1024}
+      ALIGN_MODEL: ${ALIGN_MODEL:-sentence-transformers/LaBSE}
+      EMBED_BATCH_SIZE: ${EMBED_BATCH_SIZE:-32}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-thot}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me}
+      MINIO_BOOKS_BUCKET: ${MINIO_BOOKS_BUCKET:-books}
+    volumes:
+      - ./books:/books:ro
+      # Modèles Hugging Face téléchargés une seule fois
+      - hf_cache:/cache/huggingface
+
+  # Corpus API (lecture du corpus pour les applications) :
+  #   docker compose --profile api up -d api      → http://localhost:8000/v1/docs
+  api:
+    build:
+      context: .
+      dockerfile: corpus-api/Dockerfile
+    image: thot-api
+    profiles: ["api"]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-thot}:${POSTGRES_PASSWORD:-thot}@postgres:5432/${POSTGRES_DB:-thot}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-chunks}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-thot}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me}
+      MINIO_BOOKS_BUCKET: ${MINIO_BOOKS_BUCKET:-books}
+      OIDC_ISSUER: ${OIDC_ISSUER:-http://localhost:8080/realms/thot}
+      # localhost:8080 n'existe pas dans le conteneur : clés lues par le réseau interne
+      OIDC_DISCOVERY_URL: http://keycloak:8080/realms/thot
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-corpus-api}
+      AUTH_DISABLED: ${AUTH_DISABLED:-false}
+      API_DEVICE: ${API_DEVICE:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-[]}
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+    volumes:
+      # Mêmes modèles que l'ingestion, téléchargés une seule fois
+      - hf_cache:/cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/health')"]
+      interval: 15s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+
+  # Liseuse (Next.js) et sa synchronisation avec le corpus :
+  #   docker compose --profile api --profile reader up -d   → http://localhost:3000
+  # Migrations de la base `reader` appliquées au démarrage du conteneur.
+  reader:
+    build:
+      context: ./reader
+    image: thot-reader
+    profiles: ["reader"]
+    restart: unless-stopped
+    depends_on:
+      databases:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+        required: false
+    ports:
+      - "${READER_PORT:-3000}:3000"
+    environment: &reader-env
+      BETTER_AUTH_URL: ${READER_URL:-http://localhost:3000}
+      BETTER_AUTH_SECRET: ${READER_AUTH_SECRET:-dev-secret-change-me-dev-secret-change-me}
+      READER_DATABASE_URL: postgresql://${POSTGRES_USER:-thot}:${POSTGRES_PASSWORD:-thot}@postgres:5432/reader
+      # Émetteur public des jetons ; configuration OpenID lue par le réseau interne
+      OIDC_ISSUER: ${OIDC_ISSUER:-http://localhost:8080/realms/thot}
+      OIDC_DISCOVERY_URL: http://keycloak:8080/realms/thot
+      READER_CLIENT_ID: thot-reader
+      READER_CLIENT_SECRET: ${READER_CLIENT_SECRET:-dev-reader-secret}
+      CORPUS_API_URL: ${CORPUS_API_URL:-http://api:8000}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/manifest.webmanifest"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  # Suit /v1/changes : recale les progressions quand un texte est remplacé
+  reader-worker:
+    image: thot-reader
+    profiles: ["reader"]
+    restart: unless-stopped
+    depends_on:
+      reader:
+        condition: service_healthy
+    environment:
+      <<: *reader-env
+      WORKER_INTERVAL: ${READER_WORKER_INTERVAL:-60}
+    command: ["node", "worker.mjs"]
+
 volumes:
   postgres_data:
   qdrant_data:
   pgadmin_data:
   minio_data:
+  hf_cache:

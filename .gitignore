@@ -6,7 +6,12 @@ __pycache__/
 *.py[cod]
 .venv/
 .pytest_cache/
+.ruff_cache/
 
 # Données locales
 data/
 *.log
+
+# Corpus local (volumineux, droits d'auteur)
+books/
+.playwright-mcp/

@@ -1,0 +1,17 @@
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/tests
+!reader/tests
+.git
+books
+docs
+pgadmin
+reader/node_modules
+reader/.next
+reader/.env*
+!reader/.env.example
+reader/test-results
+reader/playwright-report
+.playwright-mcp

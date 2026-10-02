@@ -1,0 +1,5 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": ["core", "ingest", "corpus-api"]
+}

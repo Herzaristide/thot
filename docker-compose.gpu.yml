@@ -1,0 +1,15 @@
+# Accès au GPU NVIDIA pour l'ingestion (vectorisation, alignement) et pour
+# l'API (encodage des requêtes : ~50 ms sur GPU contre ~650 ms sur CPU).
+#
+# Prérequis côté hôte : NVIDIA Container Toolkit en mode CDI.
+# Sur NixOS : `hardware.nvidia-container-toolkit.enable = true;`
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml run --rm ingest index run <collection>
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile api up -d api
+services:
+  ingest:
+    devices:
+      - nvidia.com/gpu=all
+  api:
+    devices:
+      - nvidia.com/gpu=all

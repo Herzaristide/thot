@@ -82,12 +82,13 @@ export async function recentProgress(sub: string, limit = 12, opts: { unfinished
   return rows.map((r) => ({ ...r, work: works.get(r.workId) ?? null }));
 }
 
-export async function progressFor(sub: string, editionIds: string[]) {
-  if (editionIds.length === 0) return [];
-  return db
+/** Progression d'une œuvre, commune à toutes ses éditions. */
+export async function progressFor(sub: string, workId: string) {
+  const [row] = await db
     .select()
     .from(readingProgress)
-    .where(and(eq(readingProgress.userSub, sub), inArray(readingProgress.editionId, editionIds)));
+    .where(and(eq(readingProgress.userSub, sub), eq(readingProgress.workId, workId)));
+  return row ?? null;
 }
 
 // ----------------------------------------------------------------- favoris

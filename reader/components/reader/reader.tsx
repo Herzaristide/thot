@@ -21,7 +21,7 @@ import type { FindHit, Note, Toc } from "@/lib/api/types";
 import { useOnline } from "@/lib/hooks";
 import { usePreferences } from "@/lib/prefs/store";
 import { prefetchRange, type RangeData, rangeQuery } from "@/lib/reader/data";
-import { localProgress, useProgressSync } from "@/lib/reader/progress";
+import { localPosition, useProgressSync } from "@/lib/reader/progress";
 import { buildUnits, firstBodyUnit, type Unit, unitOf } from "@/lib/reader/units";
 import { useViewer } from "@/lib/viewer";
 import { DownloadButton } from "./download-button";
@@ -101,9 +101,9 @@ export function Reader({
   useEffect(() => {
     if (ready) return;
     let cancelled = false;
-    void localProgress(edition.id).then((p) => {
+    void localPosition(edition.work.id, edition).then((p) => {
       if (cancelled) return;
-      const seq = p && p.revision === edition.revision ? p.seq : (firstBodyUnit(units)?.from ?? 0);
+      const seq = p?.seq ?? firstBodyUnit(units)?.from ?? 0;
       setTarget({ seq, offset: p?.offset ?? 0, flash: false, key: 0 });
       setCurrent(seq);
       setReady(true);
@@ -111,7 +111,7 @@ export function Reader({
     return () => {
       cancelled = true;
     };
-  }, [ready, edition.id, edition.revision, units]);
+  }, [ready, edition, units]);
 
   const unit: Unit | undefined = unitOf(units, current) ?? units[0];
   const [flash, setFlash] = useFlash(start?.highlight ? start.seq : null);

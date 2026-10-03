@@ -134,11 +134,13 @@ preferences (
   updated_at  timestamptz NOT NULL
 )
 
--- Progression : une ligne par édition lue
+-- Progression : une ligne par œuvre, quelle que soit la traduction lue.
+-- La position se rapporte à edition_id (dernière édition lue) ; ouvrir une
+-- autre édition la convertit par /counterpart (à défaut : même pourcentage).
 reading_progress (
   user_sub     text,
-  edition_id   uuid,
-  work_id      uuid NOT NULL,
+  work_id      uuid,
+  edition_id   uuid NOT NULL,
   revision     int  NOT NULL,
   seq          int  NOT NULL,
   "offset"     int  NOT NULL DEFAULT 0,
@@ -148,7 +150,7 @@ reading_progress (
   started_at   timestamptz NOT NULL,
   updated_at   timestamptz NOT NULL,  -- horodatage client : « le plus récent gagne »
   finished_at  timestamptz,
-  PRIMARY KEY (user_sub, edition_id)
+  PRIMARY KEY (user_sub, work_id)
 )
 -- index (user_sub, updated_at DESC) : « Continuer la lecture »
 
@@ -199,7 +201,7 @@ session, jamais du corps de la requête) :
 | --- | --- | --- |
 | GET, PUT | `/api/me/preferences` | lire / remplacer (le plus récent `updated_at` gagne) |
 | GET | `/api/me/progress?limit=` | progressions récentes (accueil, bibliothèque) |
-| GET, PUT, DELETE | `/api/me/progress/{editionId}` | une progression ; PUT ignoré si plus ancien que l'existant |
+| GET, PUT, DELETE | `/api/me/progress/{workId}` | la progression d'une œuvre (corps : `editionId` + position) ; PUT ignoré si plus ancien que l'existant |
 | GET | `/api/me/favorites` | favoris |
 | PUT, DELETE | `/api/me/favorites/{workId}` | ajouter / retirer (idempotents) |
 | GET, POST | `/api/me/collections` | lister / créer |

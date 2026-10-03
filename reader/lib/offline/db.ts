@@ -34,14 +34,14 @@ export type OfflineSegments = {
   notes: Record<string, unknown> | null;
 };
 
-/** Progression locale (écrite à chaque changement, envoyée ensuite). */
+/** Progression locale d'une œuvre (écrite à chaque changement, envoyée ensuite). */
 export type LocalProgress = {
-  editionId: string;
+  workId: string;
   body: ProgressBody;
 };
 
 export type ProgressBody = {
-  workId: string;
+  editionId: string;
   revision: number;
   seq: number;
   offset: number;
@@ -57,7 +57,7 @@ class ReaderDB extends Dexie {
   outbox!: EntityTable<OutboxEntry, "key">;
   books!: EntityTable<OfflineBook, "key">;
   segments!: EntityTable<OfflineSegments, "key">;
-  progress!: EntityTable<LocalProgress, "editionId">;
+  workProgress!: EntityTable<LocalProgress, "workId">;
   kv!: EntityTable<{ key: string; value: unknown }, "key">;
 
   constructor() {
@@ -69,6 +69,8 @@ class ReaderDB extends Dexie {
       progress: "editionId",
       kv: "key",
     });
+    // Progression par œuvre (et non plus par édition) : Dexie ne change pas de clé, nouvelle table
+    this.version(2).stores({ progress: null, workProgress: "workId" });
   }
 }
 

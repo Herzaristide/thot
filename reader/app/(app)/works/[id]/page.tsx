@@ -50,26 +50,18 @@ export default async function WorkPage({ params }: Props) {
   const { prefs } = await loadViewer();
 
   const [progress, favorite, collections] = sub
-    ? await Promise.all([
-        progressFor(
-          sub,
-          work.editions.map((e) => e.id),
-        ),
-        isFavorite(sub, work.id),
-        listCollections(sub),
-      ])
-    : [[], false, []];
+    ? await Promise.all([progressFor(sub, work.id), isFavorite(sub, work.id), listCollections(sub)])
+    : [null, false, []];
 
   const readable = (e: EditionSummary) => e.access !== "excerpt";
-  const latest = [...progress].sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())[0];
   const langs = prefs?.data.readingLangs ?? ["fr"];
+  // La progression vaut pour toutes les éditions : on reprend dans la dernière lue
   const preferred =
-    (latest && work.editions.find((e) => e.id === latest.editionId)) ??
+    (progress && work.editions.find((e) => e.id === progress.editionId && readable(e))) ??
     langs.map((l) => work.editions.find((e) => e.language === l && readable(e))).find(Boolean) ??
     work.editions.find((e) => e.is_original && readable(e)) ??
     work.editions.find(readable);
 
-  const progressByEdition = new Map(progress.map((p) => [p.editionId, p]));
   const editions = [...work.editions].sort(
     (a, b) => Number(b.is_original) - Number(a.is_original) || a.language.localeCompare(b.language),
   );
@@ -138,7 +130,7 @@ export default async function WorkPage({ params }: Props) {
               <Button asChild size="lg">
                 <Link href={`/read/${preferred.id}`}>
                   <BookOpen aria-hidden />
-                  {progressByEdition.has(preferred.id) ? "Reprendre" : "Lire"}
+                  {progress ? "Reprendre" : "Lire"}
                   <span className="opacity-75">· {languageName(preferred.language)}</span>
                 </Link>
               </Button>
@@ -162,6 +154,14 @@ export default async function WorkPage({ params }: Props) {
               </>
             )}
           </div>
+          {progress && (
+            <div className="mt-4 flex max-w-xs items-center gap-2 text-xs text-muted-foreground">
+              <div className="h-1 flex-1 overflow-hidden rounded-full bg-muted">
+                <div className="h-full bg-primary" style={{ width: percent(progress.progress) }} />
+              </div>
+              <span className="tabular-nums">{percent(progress.progress)}</span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -169,7 +169,7 @@ export default async function WorkPage({ params }: Props) {
         <h2 className="mb-4 font-serif text-xl font-semibold">Éditions et traductions</h2>
         <ul className="divide-y rounded-xl border">
           {editions.map((e) => {
-            const p = progressByEdition.get(e.id);
+            const lastRead = progress?.editionId === e.id;
             return (
               <li key={e.id} className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center">
                 <div className="min-w-0 flex-1">
@@ -181,6 +181,7 @@ export default async function WorkPage({ params }: Props) {
                     {e.is_original && <Badge variant="outline">Original</Badge>}
                     {e.access === "excerpt" && <Badge variant="outline">Extraits seulement</Badge>}
                     {e.access === "restricted" && <Badge variant="outline">Restreinte</Badge>}
+                    {lastRead && <Badge>Dernière lue</Badge>}
                   </div>
                   <div className="mt-1 text-sm text-muted-foreground">
                     {[
@@ -200,17 +201,9 @@ export default async function WorkPage({ params }: Props) {
                     </div>
                   )}
                 </div>
-                {p && (
-                  <div className="flex items-center gap-2 text-xs text-muted-foreground sm:w-32">
-                    <div className="h-1 flex-1 overflow-hidden rounded-full bg-muted">
-                      <div className="h-full bg-primary" style={{ width: percent(p.progress) }} />
-                    </div>
-                    <span className="tabular-nums">{percent(p.progress)}</span>
-                  </div>
-                )}
                 {readable(e) ? (
                   <Button asChild variant="outline" size="sm">
-                    <Link href={`/read/${e.id}`}>{p ? "Reprendre" : "Lire"}</Link>
+                    <Link href={`/read/${e.id}`}>{progress ? "Reprendre" : "Lire"}</Link>
                   </Button>
                 ) : (
                   <Button variant="outline" size="sm" disabled>

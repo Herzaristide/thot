@@ -61,17 +61,37 @@ class AlignEncoder:
         ).astype(np.float32)
 
 
-def works_to_align(conn: psycopg.Connection, slug: str | None = None) -> list[dict]:
+def works_to_align(
+    conn: psycopg.Connection, slug: str | None = None, ids: list[uuid.UUID] | None = None
+) -> list[dict]:
+    """Œuvres d'au moins deux éditions extraites (filtrées par slug ou par identifiants)."""
     return conn.execute(
         """
-        SELECT w.id, w.slug, w.title, count(e.id) AS n_editions
+        SELECT w.id, w.slug, w.title, count(e.id) AS n_editions,
+               bool_or(e.is_original) AS has_original
         FROM works w JOIN editions e ON e.work_id = w.id
         WHERE EXISTS (SELECT 1 FROM segments s WHERE s.edition_id = e.id)
+          AND e.deleted_at IS NULL
           AND (%(slug)s::text IS NULL OR w.slug = %(slug)s)
+          AND (%(ids)s::uuid[] IS NULL OR w.id = ANY(%(ids)s))
         GROUP BY w.id HAVING count(e.id) >= 2
         ORDER BY w.slug
         """,
-        {"slug": slug},
+        {"slug": slug, "ids": ids},
+    ).fetchall()
+
+
+def works_without_original(conn: psycopg.Connection) -> list[dict]:
+    """Œuvres à plusieurs éditions dont l'original n'est pas en base : leur
+    alignement repose sur une référence provisoire (l'édition la plus longue)."""
+    return conn.execute(
+        """
+        SELECT w.slug, count(e.id) AS n_editions
+        FROM works w JOIN editions e ON e.work_id = w.id
+        WHERE e.deleted_at IS NULL
+        GROUP BY w.id HAVING count(e.id) >= 2 AND NOT bool_or(e.is_original)
+        ORDER BY w.slug
+        """
     ).fetchall()
 
 
@@ -111,9 +131,42 @@ def _number_bonus(ref: list[Sec], tgt: list[Sec]) -> np.ndarray:
 
 
 def align_work(
-    conn: psycopg.Connection, encoder: AlignEncoder, work: dict, force: bool = False
+    conn: psycopg.Connection,
+    encoder: AlignEncoder,
+    work: dict,
+    force: bool = False,
+    incremental: bool = False,
 ) -> list[dict]:
-    """Aligne toutes les éditions d'une œuvre ; retourne la qualité par édition."""
+    """Aligne les éditions d'une œuvre sur sa référence ; retourne la qualité par édition.
+
+    incremental : si la référence n'a pas changé, n'aligne que les éditions en
+    attente (sans ligne `edition_alignments` : nouvelles ou réextraites), sur
+    les unités existantes, sans toucher aux autres. Sinon (nouvelle référence,
+    par exemple l'original arrivé après ses traductions), réaligne toute l'œuvre.
+    """
+    editions = conn.execute(
+        """
+        SELECT e.id, e.source_file, e.language, e.is_original,
+               (SELECT count(*) FROM segments s JOIN sections sec ON sec.id = s.section_id
+                 WHERE s.edition_id = e.id AND sec.matter = 'body') AS n_body,
+               ea.edition_id IS NOT NULL AS aligned,
+               (ea.edition_id IS NOT NULL AND ea.reference_edition_id IS NULL) AS is_reference
+        FROM editions e LEFT JOIN edition_alignments ea ON ea.edition_id = e.id
+        WHERE e.work_id = %s AND e.deleted_at IS NULL
+          AND EXISTS (SELECT 1 FROM segments s WHERE s.edition_id = e.id)
+        """,
+        (work["id"],),
+    ).fetchall()
+    reference = max(editions, key=lambda e: (e["is_original"], e["n_body"]))
+    if incremental and reference["is_reference"]:
+        pending = [e for e in editions if not e["aligned"]]
+        if not pending:
+            return []
+        reports = _align_pending(conn, encoder, work, reference, pending)
+        if reports is not None:
+            return reports
+        # Unités de la référence incomplètes : on refait tout
+
     manual = conn.execute(
         "SELECT 1 FROM segment_alignments sa JOIN work_units u ON u.id = sa.unit_id "
         "WHERE u.work_id = %s AND sa.method = 'manual' LIMIT 1",
@@ -122,17 +175,6 @@ def align_work(
     if manual and not force:
         raise RuntimeError("l'œuvre contient des liens corrigés à la main (relancer avec --force)")
 
-    editions = conn.execute(
-        """
-        SELECT e.id, e.source_file, e.language, e.is_original,
-               (SELECT count(*) FROM segments s JOIN sections sec ON sec.id = s.section_id
-                 WHERE s.edition_id = e.id AND sec.matter = 'body') AS n_body
-        FROM editions e WHERE e.work_id = %s
-          AND EXISTS (SELECT 1 FROM segments s WHERE s.edition_id = e.id)
-        """,
-        (work["id"],),
-    ).fetchall()
-    reference = max(editions, key=lambda e: (e["is_original"], e["n_body"]))
     sections = {e["id"]: _load_sections(conn, e["id"]) for e in editions}
 
     all_segments = [x for secs in sections.values() for s in secs for x in s.segments]
@@ -168,52 +210,108 @@ def align_work(
         for edition in editions:
             if edition["id"] == reference["id"]:
                 continue
-            tgt_sections = sections[edition["id"]]
-            report = _align_edition(ref_sections, tgt_sections, seg_vec, unit_of, links, cur)
-            report["edition_id"] = edition["id"]
-            report["source_file"] = edition["source_file"]
-            status = (
-                "reliable"
-                if (
-                    report["aligned_ratio"] >= RELIABLE["aligned_ratio"]
-                    and (report["mean_score"] or 0) >= RELIABLE["mean_score"]
-                    and report["low_score_ratio"] <= RELIABLE["low_score_ratio"]
-                )
-                else "doubtful"
-            )
-            report["status"] = status
-            conn.execute(
-                """
-                INSERT INTO edition_alignments (edition_id, reference_edition_id, method,
-                    n_segments, n_aligned_segments, mean_score, low_score_ratio, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    edition["id"],
-                    reference["id"],
-                    METHOD,
-                    report["n_segments"],
-                    report["n_aligned"],
-                    report["mean_score"],
-                    report["low_score_ratio"],
-                    status,
-                ),
-            )
-            reports.append(report)
+            report = _align_edition(ref_sections, sections[edition["id"]], seg_vec, unit_of, links, cur)
+            reports.append(_save_report(conn, edition, reference, report))
 
-        with cur.copy("COPY segment_alignments (segment_id, unit_id, score, method) FROM STDIN") as copy:
-            for row in links:
-                copy.write_row(row)
-        emit(
-            conn,
-            "work.alignment_changed",
-            work["id"],
-            data={
-                "reference_edition_id": str(reference["id"]),
-                "editions": {str(r["edition_id"]): r["status"] for r in reports},
-            },
-        )
+        _copy_links(cur, links)
+        _emit_changed(conn, work, reference, reports)
     return [{"source_file": reference["source_file"], "status": "reference"}, *reports]
+
+
+def _align_pending(
+    conn: psycopg.Connection, encoder: AlignEncoder, work: dict, reference: dict, pending: list[dict]
+) -> list[dict] | None:
+    """Aligne seulement `pending` sur les unités existantes de la référence.
+    None si des segments de la référence n'ont pas d'unité (alignement à refaire)."""
+    ref_sections = _load_sections(conn, reference["id"])
+    ref_segments = [x for s in ref_sections for x in s.segments]
+    unit_of = {
+        r["segment_id"]: r["unit_id"]
+        for r in conn.execute(
+            "SELECT sa.segment_id, sa.unit_id FROM segment_alignments sa "
+            "JOIN segments s ON s.id = sa.segment_id "
+            "WHERE s.edition_id = %s AND sa.method = 'reference'",
+            (reference["id"],),
+        ).fetchall()
+    }
+    if any(x["id"] not in unit_of for x in ref_segments):
+        return None
+
+    sections = {e["id"]: _load_sections(conn, e["id"]) for e in pending}
+    all_segments = ref_segments + [x for secs in sections.values() for s in secs for x in s.segments]
+    vectors = encoder.encode([x["text"] for x in all_segments])
+    seg_vec = {x["id"]: v for x, v in zip(all_segments, vectors, strict=True)}
+
+    reports = []
+    links: list[tuple] = []
+    with conn.transaction():
+        cur = conn.cursor()
+        for edition in pending:
+            # Restes d'un alignement interrompu de cette édition
+            conn.execute(
+                "UPDATE sections SET reference_section_id = NULL WHERE edition_id = %s", (edition["id"],)
+            )
+            conn.execute(
+                "DELETE FROM segment_alignments sa USING segments s "
+                "WHERE s.id = sa.segment_id AND s.edition_id = %s",
+                (edition["id"],),
+            )
+            report = _align_edition(ref_sections, sections[edition["id"]], seg_vec, unit_of, links, cur)
+            reports.append(_save_report(conn, edition, reference, report))
+        _copy_links(cur, links)
+        _emit_changed(conn, work, reference, reports)
+    return reports
+
+
+def _save_report(conn: psycopg.Connection, edition: dict, reference: dict, report: dict) -> dict:
+    """Qualité de l'alignement d'une édition (`edition_alignments`)."""
+    report["edition_id"] = edition["id"]
+    report["source_file"] = edition["source_file"]
+    report["status"] = (
+        "reliable"
+        if (
+            report["aligned_ratio"] >= RELIABLE["aligned_ratio"]
+            and (report["mean_score"] or 0) >= RELIABLE["mean_score"]
+            and report["low_score_ratio"] <= RELIABLE["low_score_ratio"]
+        )
+        else "doubtful"
+    )
+    conn.execute(
+        """
+        INSERT INTO edition_alignments (edition_id, reference_edition_id, method,
+            n_segments, n_aligned_segments, mean_score, low_score_ratio, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            edition["id"],
+            reference["id"],
+            METHOD,
+            report["n_segments"],
+            report["n_aligned"],
+            report["mean_score"],
+            report["low_score_ratio"],
+            report["status"],
+        ),
+    )
+    return report
+
+
+def _copy_links(cur, links: list[tuple]) -> None:
+    with cur.copy("COPY segment_alignments (segment_id, unit_id, score, method) FROM STDIN") as copy:
+        for row in links:
+            copy.write_row(row)
+
+
+def _emit_changed(conn: psycopg.Connection, work: dict, reference: dict, reports: list[dict]) -> None:
+    emit(
+        conn,
+        "work.alignment_changed",
+        work["id"],
+        data={
+            "reference_edition_id": str(reference["id"]),
+            "editions": {str(r["edition_id"]): r["status"] for r in reports},
+        },
+    )
 
 
 def _align_edition(

@@ -112,6 +112,7 @@ def pending_editions(conn: psycopg.Connection, index: VectorIndex) -> list[dict]
         SELECT e.id, e.source_file, e.language
         FROM editions e
         WHERE EXISTS (SELECT 1 FROM segments s WHERE s.edition_id = e.id)
+          AND e.deleted_at IS NULL
           AND NOT EXISTS (SELECT 1 FROM edition_indexings ei
                           WHERE ei.edition_id = e.id AND ei.index_id = %s)
         ORDER BY e.source_file
@@ -198,14 +199,48 @@ def _section_info(conn: psycopg.Connection, edition_id: uuid.UUID) -> dict:
     return {r["section_id"]: r for r in rows}
 
 
+def payload_fields(ctx: dict) -> dict:
+    """Champs du payload Qdrant qui viennent de la fiche (pas du texte)."""
+    return {
+        "work_id": str(ctx["work_id"]),
+        "language": ctx["language"],
+        "is_original": ctx["is_original"],
+        "access": ctx["access"],
+        "author_ids": ctx["author_ids"],
+        "movement_ids": ctx["movement_ids"],
+        "first_published_year": ctx["first_published_year"],
+    }
+
+
+def active_index(conn: psycopg.Connection) -> VectorIndex | None:
+    row = conn.execute(
+        "SELECT id, collection, dense_model, dense_dim, sparse_model, chunker_version, status::text "
+        "FROM vector_indexes WHERE status = 'active' LIMIT 1"
+    ).fetchone()
+    return VectorIndex(**row) if row else None
+
+
+def drop_edition(conn: psycopg.Connection, qc: QdrantClient, edition_id: uuid.UUID) -> int:
+    """Retire l'édition de tous les index (points Qdrant, edition_indexings) ;
+    garde ses chunks sauf `drop_chunks`. Renvoie le nombre d'index touchés."""
+    rows = conn.execute(
+        "SELECT v.collection FROM edition_indexings ei JOIN vector_indexes v ON v.id = ei.index_id "
+        "WHERE ei.edition_id = %s",
+        (edition_id,),
+    ).fetchall()
+    for row in rows:
+        qstore.delete_edition(qc, row["collection"], edition_id)
+    conn.execute("DELETE FROM edition_indexings WHERE edition_id = %s", (edition_id,))
+    return len(rows)
+
+
 def sync_edition_payload(
     conn: psycopg.Connection, qc: QdrantClient, edition_id: uuid.UUID, collection: str | None = None
 ) -> None:
-    """Recopie les champs modifiables sans réindexer (droits `access`) dans
-    chaque collection qui indexe l'édition."""
-    edition = conn.execute(
-        "SELECT access::text AS access FROM editions WHERE id = %s", (edition_id,)
-    ).fetchone()
+    """Recopie dans chaque collection qui indexe l'édition les champs de la
+    fiche copiés dans le payload (droits, œuvre, langue, auteurs, courants,
+    année) : modifiables dans la console sans réindexer."""
+    ctx = _edition_context(conn, edition_id)
     collections = conn.execute(
         "SELECT v.collection FROM edition_indexings ei JOIN vector_indexes v ON v.id = ei.index_id "
         "WHERE ei.edition_id = %(e)s AND (%(c)s::text IS NULL OR v.collection = %(c)s)",
@@ -213,7 +248,7 @@ def sync_edition_payload(
     ).fetchall()
     for row in collections:
         qstore.ensure_payload_indexes(qc, row["collection"])
-        qstore.set_edition_payload(qc, row["collection"], edition_id, {"access": edition["access"]})
+        qstore.set_edition_payload(qc, row["collection"], edition_id, payload_fields(ctx))
 
 
 def index_edition(
@@ -242,14 +277,8 @@ def index_edition(
                     qstore.SPARSE: models.SparseVector(indices=idx, values=val),
                 },
                 payload={
-                    "work_id": str(ctx["work_id"]),
+                    **payload_fields(ctx),
                     "edition_id": str(edition["id"]),
-                    "language": ctx["language"],
-                    "is_original": ctx["is_original"],
-                    "access": ctx["access"],
-                    "author_ids": ctx["author_ids"],
-                    "movement_ids": ctx["movement_ids"],
-                    "first_published_year": ctx["first_published_year"],
                     "section_id": str(section_id),
                     "section_kind": section.get("kind"),
                     "section_path": section.get("path_text"),

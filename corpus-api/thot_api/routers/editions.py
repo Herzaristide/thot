@@ -53,7 +53,8 @@ async def load_edition(conn: Conn, edition_id: UUID, principal: Principal) -> di
             """
             SELECT e.id, e.work_id, e.title, e.language, e.revision, e.access::text AS access,
                    e.sha256, e.epub_object_key, e.source_file, w.slug
-            FROM editions e JOIN works w ON w.id = e.work_id WHERE e.id = %s
+            FROM editions e JOIN works w ON w.id = e.work_id
+            WHERE e.id = %s AND e.deleted_at IS NULL
             """,
             (edition_id,),
         )

@@ -17,7 +17,18 @@ from thot_api import errors
 from thot_api.auth import TokenVerifier
 from thot_api.config import Settings, get_settings
 from thot_api.engine import SearchEngine
-from thot_api.routers import alignment, catalog, changes, editions, meta, search
+from thot_api.routers import (
+    admin,
+    admin_alignment,
+    admin_catalog,
+    admin_uploads,
+    alignment,
+    catalog,
+    changes,
+    editions,
+    meta,
+    search,
+)
 from thot_core import s3
 
 log = logging.getLogger("thot_api")
@@ -75,13 +86,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=settings.cors_origins,
-            allow_methods=["GET", "HEAD", "POST", "DELETE"],
-            allow_headers=["Authorization", "Content-Type", "If-None-Match", "Range", "Accept-Language"],
+            allow_methods=["GET", "HEAD", "POST", "PATCH", "PUT", "DELETE"],
+            allow_headers=[
+                "Authorization",
+                "Content-Type",
+                "If-None-Match",
+                "If-Match",
+                "Range",
+                "Accept-Language",
+            ],
             expose_headers=["ETag", "Content-Range", "Content-Disposition"],
         )
 
     v1 = APIRouter(prefix="/v1")
-    for module in (meta, catalog, editions, search, alignment, changes):
+    for module in (
+        meta,
+        catalog,
+        editions,
+        search,
+        alignment,
+        changes,
+        admin,
+        admin_uploads,
+        admin_catalog,
+        admin_alignment,
+    ):
         v1.include_router(module.router)
     app.include_router(v1)
     return app

@@ -69,8 +69,9 @@ def translators_json(edition: str = "e") -> str:
 
 
 def visible(edition: str = "e") -> str:
-    """L'édition est visible par l'appelant (droits `access`)."""
-    return f"{edition}.access::text = ANY(%(access)s)"
+    """L'édition est visible par l'appelant (droits `access`) et n'est pas à
+    la corbeille (une œuvre à la corbeille y met toutes ses éditions)."""
+    return f"({edition}.access::text = ANY(%(access)s) AND {edition}.deleted_at IS NULL)"
 
 
 def work_visible(work: str = "w") -> str:

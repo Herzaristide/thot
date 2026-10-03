@@ -17,11 +17,37 @@ gérés par Keycloak et les données de chaque application dans sa propre base.
 
 ```bash
 cp .env.example .env          # ajuster les mots de passe
-docker compose up -d          # postgres + migrations + qdrant + minio + pgadmin
+docker compose up -d --build  # toute la pile, voir ci-dessous
 ```
 
-Vérifications :
+| Service | Adresse | Rôle |
+| --- | --- | --- |
+| `reader` | http://localhost:3000 | liseuse (utilisateur de dev : `lecteur` / `lecteur`) |
+| `reader-worker` | — | suit `/v1/changes`, recale les progressions |
+| `api` | http://localhost:8000/v1/docs | Corpus API (sur CPU par défaut) |
+| `keycloak` | http://localhost:8080/admin | identité (realm `thot`) |
+| `postgres` | localhost:5432 | bases `thot` (corpus), `keycloak`, `reader` |
+| `qdrant` / `minio` | :6333 / :9000-9001 | index vectoriels / EPUB |
+| `pgadmin` | http://localhost:5050 | visualisation du schéma |
+| `migrate`, `databases` | — | migrations du corpus, création des bases (puis s'arrêtent) |
 
+Ordre de démarrage géré par les `depends_on` : Postgres → migrations et
+bases → Keycloak, Qdrant, MinIO → API (saine une fois le modèle chargé) →
+liseuse (applique ses migrations) → worker. Seule l'ingestion reste une
+commande à la demande (`docker compose run --rm ingest …`).
+
+Modèles (Qwen3, LaBSE) : volume `hf_cache`, téléchargés au premier
+démarrage ; pour réutiliser ceux de l'hôte :
+`docker run --rm -v thot_hf_cache:/c -v ~/.cache/huggingface/hub:/src:ro alpine sh -c 'mkdir -p /c/hub && cp -a /src/. /c/hub/'`
+puis `HF_HUB_OFFLINE=1` dans `.env` (démarrage plus rapide).
+
+GPU (recherche « thème » ~50 ms au lieu de ~650–900 ms) :
+`docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d`,
+qui demande le NVIDIA Container Toolkit en mode CDI (NixOS :
+`hardware.nvidia-container-toolkit.enable = true;`).
+
+Vérifications :
+ééé
 ```bash
 docker compose ps
 curl http://localhost:6333/healthz                    # Qdrant
@@ -169,8 +195,8 @@ curl -X POST localhost:8000/v1/search -H 'content-type: application/json' \
 
 uv run pytest corpus-api/tests    # unitaires + intégration sur une copie jetable de la base
 
-# conteneur (GPU conseillé : ~50 ms par requête contre ~650 ms sur CPU)
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile api up -d api
+# conteneur (démarré avec la pile ; GPU conseillé : ~50 ms par requête contre ~650 ms sur CPU)
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d api
 ```
 
 - **Authentification** : jetons JWT Keycloak (`OIDC_ISSUER`, audience
@@ -210,7 +236,61 @@ réappliquer le fichier, supprimer le realm dans la console (ou la base
 
 Les jetons portent l'émetteur public `KEYCLOAK_URL` ; les conteneurs
 joignent Keycloak par `http://keycloak:8080` (backchannel dynamique).
-Plan de la liseuse : [`docs/reader.md`](docs/reader.md).
+Plan et état de la liseuse : [`docs/reader.md`](docs/reader.md).
+
+Thème de connexion : `keycloak/themes/thot` (couleurs de la liseuse), monté
+dans le conteneur et activé par `loginTheme` dans le realm. Sur un realm déjà
+importé : `kcadm.sh update realms/thot -s loginTheme=thot`.
+
+## Liseuse (reader/)
+
+Application Next.js 16 (PWA) qui lit le corpus **uniquement via la Corpus
+API** et garde les données de ses lecteurs (préférences, progression,
+favoris, collections) dans sa propre base `reader`. Connexion par Keycloak
+(Better Auth), jetons gardés côté serveur (BFF).
+
+```bash
+nix develop                        # Node 22, pnpm, navigateurs Playwright
+cd reader
+cp .env.example .env.local         # valeurs de développement
+pnpm install
+pnpm db:migrate                    # base `reader` (Drizzle)
+pnpm dev                           # http://localhost:3000 (Corpus API sur :8000)
+
+pnpm gen:api                       # régénère lib/api/schema.d.ts depuis /v1/openapi.json
+pnpm lint && pnpm typecheck && pnpm test
+pnpm build && pnpm test:e2e        # bout en bout : build de production, base jetable reader_e2e
+pnpm worker --once                 # synchronisation /v1/changes (recalage des progressions)
+```
+
+En conteneur, la liseuse démarre avec le reste de la pile (`docker compose
+up -d`) ; ses migrations s'appliquent au démarrage, le worker est le service
+`reader-worker`. Après une modification du code : `docker compose up -d --build reader reader-worker`.
+
+Le client Keycloak `thot-reader` n'accepte que `READER_URL`
+(`http://localhost:3000` par défaut) : les tests de bout en bout ont besoin
+du port 3000 libre (`docker compose stop reader` avant `pnpm dev` ou `pnpm test:e2e`).
+
+## Console d'administration (console/)
+
+Supervision, dépôt d'EPUB (classés automatiquement dans leur œuvre, puis
+validés), qualité des éditions, fiches et structure, corbeille, atelier
+d'alignement. Plan et décisions : `docs/console.md`.
+
+```bash
+docker compose up -d                 # console → http://localhost:3001 (utilisateur de dév. : lecteur / lecteur)
+docker compose logs -f ingest-worker # worker : dépôts, retraitements, alignements, corbeille
+# GPU pour le worker (CDI NVIDIA requis) :
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d ingest-worker
+
+# Sans Docker
+thot worker                          # même worker, sur l'hôte (GPU direct)
+thot quality --reparse               # (re)calcule la qualité de toutes les éditions
+cd console && pnpm dev               # console en développement (port 3001)
+```
+
+La base est la référence des fiches : `thot extract` ne réécrit plus une
+fiche déjà en base (`--overwrite-metadata` pour forcer le `work.toml`).
 
 ## Schéma Postgres
 
@@ -359,12 +439,15 @@ Console web sur http://localhost:9001 (identifiants `MINIO_ROOT_USER` /
 ```
 thot/
 ├── flake.nix                # environnement de développement (nix develop)
-├── docker-compose.yml       # postgres + migrations + qdrant + minio + pgadmin (+ ingest, api)
-├── docker-compose.gpu.yml   # accès GPU (ingestion, API)
+├── docker-compose.yml       # postgres, migrations, qdrant, minio, keycloak, api, reader, console, ingest-worker
+├── docker-compose.gpu.yml   # accès GPU (ingestion, worker, API)
 ├── pyproject.toml / uv.lock # espace de travail uv (core, ingest, corpus-api)
 ├── .env.example
 ├── docs/
-│   └── corpus-api.md        # design de l'API du corpus
+│   ├── corpus-api.md        # design de l'API du corpus
+│   ├── console.md           # plan, décisions et état de la console d'administration
+│   └── reader.md            # plan et état de la liseuse
+├── documentation/           # site de documentation (Barjavel, Mermaid) → GitHub Pages
 ├── books/                   # corpus local (ignoré par git)
 ├── core/thot_core/          # partagé : embed/ (Qwen3, BM25), qdrant.py, s3.py (EPUB)
 ├── ingest/                  # pipeline d'ingestion (Python, CLI `thot`)
@@ -377,7 +460,13 @@ thot/
 │       ├── chunking/        # segments -> chunks (v1)
 │       ├── align/           # alignement monotone (programmation dynamique)
 │       ├── store/           # Postgres (écriture du corpus, journal des changements)
-│       ├── pipeline/        # extract, index, align
+│       ├── pipeline/        # extract, index, align, steps (étapes du worker)
+│       ├── jobs.py          # file de tâches (table jobs)
+│       ├── worker.py        # thot worker
+│       ├── quality.py       # qualité des éditions (signaux, score)
+│       ├── identify.py      # classement d'un dépôt (auteurs, titres, Wikidata, contenu)
+│       ├── wikidata.py      # client Wikidata (cache en base)
+│       ├── upload.py        # traitement d'un EPUB déposé
 │       ├── search.py        # recherche en ligne de commande
 │       └── cli.py
 ├── corpus-api/              # Corpus API (FastAPI)
@@ -390,7 +479,10 @@ thot/
 │       ├── sql.py           # fragments SQL (libellés selon la langue, droits)
 │       ├── text.py          # recherche insensible aux accents, ancres, extraits
 │       ├── schemas.py       # modèles = contrat OpenAPI
-│       └── routers/         # catalog, editions, search, alignment, changes, meta
+│       └── routers/         # catalog, editions, search, alignment, changes, meta, admin*
+├── reader/                  # liseuse (Next.js 16, PWA) — voir « Liseuse »
+├── console/                 # console d'administration (Next.js 16) — voir « Console »
+├── keycloak/                # realm importé, thème de connexion « thot »
 ├── pgadmin/
 │   └── servers.json         # préconfiguration du serveur pgAdmin
 └── db/
@@ -408,6 +500,8 @@ thot/
         ├── 10_ingestions.sql
         ├── 11_users.sql
         ├── 12_alignment_reviews.sql
-        └── 20261002120000_corpus_api.sql
+        ├── 20261002120000_corpus_api.sql
+        ├── 20261003120000_console.sql
+        └── 20261003130000_workers.sql
 ```
 

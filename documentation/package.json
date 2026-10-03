@@ -1,0 +1,13 @@
+{
+  "name": "thot-documentation",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "barjavel dev",
+    "build": "barjavel build",
+    "preview": "barjavel preview"
+  },
+  "dependencies": {
+    "barjavel": "^1.0.0"
+  }
+}

@@ -21,7 +21,7 @@ import type { FindHit, Note, Toc } from "@/lib/api/types";
 import { useOnline } from "@/lib/hooks";
 import { usePreferences } from "@/lib/prefs/store";
 import { prefetchRange, type RangeData, rangeQuery } from "@/lib/reader/data";
-import { localProgress, useProgressSync } from "@/lib/reader/progress";
+import { localPosition, useProgressSync } from "@/lib/reader/progress";
 import { buildUnits, firstBodyUnit, type Unit, unitOf } from "@/lib/reader/units";
 import { useViewer } from "@/lib/viewer";
 import { DownloadButton } from "./download-button";
@@ -94,16 +94,18 @@ export function Reader({
   const [target, setTarget] = useState<Target | null>(() =>
     start ? { seq: start.seq, offset: start.offset, flash: start.highlight, key: 0 } : null,
   );
-  const [ready, setReady] = useState(start !== null);
+  // Connecté : la position vient du serveur (ou c'est une première lecture) ; visiteur :
+  // on attend la dernière position gardée sur cet appareil (IndexedDB)
+  const [ready, setReady] = useState(start !== null || viewer !== null);
   const [current, setCurrent] = useState(() => start?.seq ?? firstBodyUnit(units)?.from ?? 0);
 
   // Visiteur ou hors ligne : dernière position connue de cet appareil
   useEffect(() => {
     if (ready) return;
     let cancelled = false;
-    void localProgress(edition.id).then((p) => {
+    void localPosition(edition.work.id, edition).then((p) => {
       if (cancelled) return;
-      const seq = p && p.revision === edition.revision ? p.seq : (firstBodyUnit(units)?.from ?? 0);
+      const seq = p?.seq ?? firstBodyUnit(units)?.from ?? 0;
       setTarget({ seq, offset: p?.offset ?? 0, flash: false, key: 0 });
       setCurrent(seq);
       setReady(true);
@@ -111,7 +113,7 @@ export function Reader({
     return () => {
       cancelled = true;
     };
-  }, [ready, edition.id, edition.revision, units]);
+  }, [ready, edition, units]);
 
   const unit: Unit | undefined = unitOf(units, current) ?? units[0];
   const [flash, setFlash] = useFlash(start?.highlight ? start.seq : null);
@@ -176,13 +178,16 @@ export function Reader({
 
   // ------------------------------------------------------------ interface
   const [chrome, setChrome] = useState(true);
+  // Interactif (hydraté) : repère pour les tests de bout en bout
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => setHydrated(true), []);
   const [tocOpen, setTocOpen] = useState(false);
   const [note, setNote] = useState<OpenNote>(null);
   const parallelTarget =
     prefs.parallel.enabled && prefs.parallel.targetLang
       ? (edition.siblings.find((s) => s.language === prefs.parallel.targetLang) ?? null)
       : null;
-  const mode = parallelTarget ? "scroll" : prefs.mode;
+  const mode = prefs.mode;
 
   // Masque l'interface après quelques secondes de lecture, sauf pendant qu'on
   // s'en sert (menu, panneau ou dialogue ouvert, focus ou pointeur sur une barre)
@@ -239,13 +244,36 @@ export function Reader({
     "--reader-max": parallelTarget ? "72rem" : WIDTHS[prefs.width],
   } as CSSProperties;
 
+  // Texte du chapitre, seul ou en regard de la traduction (défilement comme pages)
+  const content =
+    range.data && unit ? (
+      parallelTarget ? (
+        <ParallelView
+          editionId={edition.id}
+          from={unit.from}
+          to={unit.to}
+          sourceSegments={range.data.segments}
+          sourceLang={edition.language}
+          target={parallelTarget}
+          showPages={prefs.showPageNumbers}
+          flashSeq={flash}
+        />
+      ) : (
+        <Segments
+          segments={range.data.segments}
+          showPages={prefs.showPageNumbers}
+          flashSeq={flash}
+        />
+      )
+    ) : null;
+
   const progress = (() => {
     const seg = segBySeq.get(current);
     return seg ? seg.char_start / Math.max(1, edition.charLength) : null;
   })();
 
   return (
-    <div className="min-h-dvh bg-reader-bg" style={style}>
+    <div className="min-h-dvh bg-reader-bg" style={style} data-ready={hydrated || undefined}>
       {/* En-tête */}
       <AnimatePresence>
         {chrome && (
@@ -326,7 +354,7 @@ export function Reader({
         </div>
       ) : mode === "paged" ? (
         <PagedView
-          key={`${unit?.index}-${prefs.size}-${prefs.lineHeight}-${prefs.font}-${prefs.width}`}
+          key={`${unit?.index}-${prefs.size}-${prefs.lineHeight}-${prefs.font}-${prefs.width}-${parallelTarget?.id}`}
           unit={unit as Unit}
           units={units}
           target={target}
@@ -335,13 +363,9 @@ export function Reader({
           onNextUnit={() => unit && goUnit(unit.index + 1)}
           onToggleChrome={() => setChrome((c) => !c)}
           onContentClick={onContentClick}
-          lang={edition.language}
+          lang={parallelTarget ? undefined : edition.language}
         >
-          <Segments
-            segments={range.data.segments}
-            showPages={prefs.showPageNumbers}
-            flashSeq={flash}
-          />
+          {content}
         </PagedView>
       ) : (
         <ScrollView
@@ -355,24 +379,7 @@ export function Reader({
           onContentClick={onContentClick}
           lang={parallelTarget ? undefined : edition.language}
         >
-          {parallelTarget && unit ? (
-            <ParallelView
-              editionId={edition.id}
-              from={unit.from}
-              to={unit.to}
-              sourceSegments={range.data.segments}
-              sourceLang={edition.language}
-              target={parallelTarget}
-              showPages={prefs.showPageNumbers}
-              flashSeq={flash}
-            />
-          ) : (
-            <Segments
-              segments={range.data.segments}
-              showPages={prefs.showPageNumbers}
-              flashSeq={flash}
-            />
-          )}
+          {content}
         </ScrollView>
       )}
 
@@ -445,9 +452,7 @@ export function Reader({
 
 /** Premier segment visible sous l'en-tête et position approximative dedans. */
 function firstVisible(root: HTMLElement): { seq: number; offset: number } | null {
-  const ps = root.querySelectorAll<HTMLElement>("p[data-seq]");
-  for (const p of ps) {
-    if (p.closest("[data-parallel-target]")) continue;
+  for (const p of sourceParagraphs(root)) {
     const r = p.getBoundingClientRect();
     if (r.bottom > HEADER + 8) {
       const len = p.textContent?.length ?? 0;
@@ -459,8 +464,16 @@ function firstVisible(root: HTMLElement): { seq: number; offset: number } | null
   return null;
 }
 
+/** Paragraphes de l'édition lue (en lecture parallèle, ceux de la traduction ont aussi un `data-seq`). */
+function sourceParagraphs(root: HTMLElement, seq?: number): HTMLElement[] {
+  const sel = seq === undefined ? "p[data-seq]" : `p[data-seq="${seq}"]`;
+  return [...root.querySelectorAll<HTMLElement>(sel)].filter(
+    (p) => !p.closest("[data-parallel-target]"),
+  );
+}
+
 function scrollToSeq(root: HTMLElement, seq: number, offset: number) {
-  const p = root.querySelector<HTMLElement>(`p[data-seq="${seq}"]`);
+  const p = sourceParagraphs(root, seq)[0];
   if (!p) return;
   const len = p.textContent?.length || 1;
   const r = p.getBoundingClientRect();
@@ -599,7 +612,8 @@ function PagedView({
   onNextUnit: () => void;
   onToggleChrome: () => void;
   onContentClick: (e: React.MouseEvent) => boolean;
-  lang: string;
+  /** Absente en lecture parallèle : chaque colonne porte sa langue. */
+  lang?: string;
   children: React.ReactNode;
 }) {
   const outer = useRef<HTMLDivElement>(null);
@@ -608,6 +622,8 @@ function PagedView({
   const [pages, setPages] = useState(1);
   const [box, setBox] = useState({ w: 0, gap: 64 });
   const touch = useRef<{ x: number; y: number } | null>(null);
+  // Dernière position lue : la page y revient quand le contenu change de longueur
+  const anchor = useRef<{ seq: number; offset: number } | null>(null);
 
   // Mesure : une colonne = une page de la largeur de la zone de texte
   const measure = useCallback(() => {
@@ -631,7 +647,7 @@ function PagedView({
       gap: (outer.current?.clientWidth ?? 0) < 640 ? 40 : 64,
     };
     if (!i || m.w === 0) return 0;
-    const p = i.querySelector<HTMLElement>(`p[data-seq="${seq}"]`);
+    const p = sourceParagraphs(i, seq)[0];
     if (!p) return 0;
     const rects = [...p.getClientRects()];
     const len = p.textContent?.length || 1;
@@ -647,6 +663,7 @@ function PagedView({
     if (!m) return;
     let p = 0;
     if (target && target.seq >= unit.from && target.seq <= unit.to) {
+      anchor.current = { seq: target.seq, offset: target.offset };
       p =
         target.seq === unit.to && target.offset === 0 && target.seq !== unit.from
           ? m.n - 1
@@ -663,6 +680,28 @@ function PagedView({
     return () => ro.disconnect();
   }, [measure]);
 
+  // Contenu chargé après coup (traduction en lecture parallèle) : nouveau nombre de
+  // pages, et retour à la page de la dernière position lue
+  useEffect(() => {
+    const i = inner.current;
+    if (!i) return;
+    let frame = 0;
+    const mo = new MutationObserver(() => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const m = measure();
+        if (!m) return;
+        const a = anchor.current;
+        setPage((p) => Math.min(a ? pageOf(a.seq, a.offset) : p, m.n - 1));
+      });
+    });
+    mo.observe(i, { childList: true, subtree: true, characterData: true });
+    return () => {
+      cancelAnimationFrame(frame);
+      mo.disconnect();
+    };
+  }, [measure, pageOf]);
+
   // Position : premier segment présent sur la page courante
   // biome-ignore lint/correctness/useExhaustiveDependencies: `page` déclenche la mesure après chaque tour de page
   useEffect(() => {
@@ -671,12 +710,15 @@ function PagedView({
     if (!i || !o || box.w === 0) return;
     const t = setTimeout(() => {
       const left = o.getBoundingClientRect().left;
-      for (const p of i.querySelectorAll<HTMLElement>("p[data-seq]")) {
+      for (const p of sourceParagraphs(i)) {
         const rects = [...p.getClientRects()];
         const idx = rects.findIndex((r) => r.right > left + 1 && r.left < left + box.w);
         if (idx >= 0) {
           const len = p.textContent?.length ?? 0;
-          onVisible(Number(p.dataset.seq), Math.floor((len * idx) / Math.max(1, rects.length)));
+          const seq = Number(p.dataset.seq);
+          const offset = Math.floor((len * idx) / Math.max(1, rects.length));
+          anchor.current = { seq, offset };
+          onVisible(seq, offset);
           return;
         }
       }

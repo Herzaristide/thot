@@ -1,7 +1,9 @@
 # Liseuse (reader) — plan
 
-> **État** : plan, rien n'est encore écrit. Keycloak (realm `thot`, client
-> `thot-reader`) et la base `reader` existent déjà dans le compose.
+> **État (2026-10-03)** : étapes 0 à 7 réalisées dans `reader/` (voir §12 pour
+> ce qui s'écarte du plan et ce qui reste ouvert). 20 tests unitaires
+> (Vitest) et 14 tests de bout en bout (Playwright, bureau + téléphone,
+> hors ligne compris) passent.
 
 Application web de lecture du corpus Thot : PWA installable sur PC et
 téléphone, lisible hors ligne, au design sobre et moderne. Elle lit le corpus
@@ -134,11 +136,13 @@ preferences (
   updated_at  timestamptz NOT NULL
 )
 
--- Progression : une ligne par édition lue
+-- Progression : une ligne par œuvre, quelle que soit la traduction lue.
+-- La position se rapporte à edition_id (dernière édition lue) ; ouvrir une
+-- autre édition la convertit par /counterpart (à défaut : même pourcentage).
 reading_progress (
   user_sub     text,
-  edition_id   uuid,
-  work_id      uuid NOT NULL,
+  work_id      uuid,
+  edition_id   uuid NOT NULL,
   revision     int  NOT NULL,
   seq          int  NOT NULL,
   "offset"     int  NOT NULL DEFAULT 0,
@@ -148,7 +152,7 @@ reading_progress (
   started_at   timestamptz NOT NULL,
   updated_at   timestamptz NOT NULL,  -- horodatage client : « le plus récent gagne »
   finished_at  timestamptz,
-  PRIMARY KEY (user_sub, edition_id)
+  PRIMARY KEY (user_sub, work_id)
 )
 -- index (user_sub, updated_at DESC) : « Continuer la lecture »
 
@@ -199,7 +203,7 @@ session, jamais du corps de la requête) :
 | --- | --- | --- |
 | GET, PUT | `/api/me/preferences` | lire / remplacer (le plus récent `updated_at` gagne) |
 | GET | `/api/me/progress?limit=` | progressions récentes (accueil, bibliothèque) |
-| GET, PUT, DELETE | `/api/me/progress/{editionId}` | une progression ; PUT ignoré si plus ancien que l'existant |
+| GET, PUT, DELETE | `/api/me/progress/{workId}` | la progression d'une œuvre (corps : `editionId` + position) ; PUT ignoré si plus ancien que l'existant |
 | GET | `/api/me/favorites` | favoris |
 | PUT, DELETE | `/api/me/favorites/{workId}` | ajouter / retirer (idempotents) |
 | GET, POST | `/api/me/collections` | lister / créer |
@@ -287,7 +291,7 @@ démarrage du conteneur.
 
 | # | Étape | Livrable vérifiable |
 | --- | --- | --- |
-| 0 | **Socle** : `reader/` (Next 16, TS strict, Tailwind v4, shadcn, Biome, Vitest), `pnpm gen:api`, Drizzle + première migration, Dockerfile, service compose, ajout au `flake.nix` (node, pnpm) | `pnpm build` et `docker compose --profile reader up` répondent |
+| 0 | **Socle** : `reader/` (Next 16, TS strict, Tailwind v4, shadcn, Biome, Vitest), `pnpm gen:api`, Drizzle + première migration, Dockerfile, service compose, ajout au `flake.nix` (node, pnpm) | `pnpm build` et `docker compose up` répond (toute la pile démarre ensemble depuis le 2026-10-03) |
 | 1 | **Auth et proxy** : Better Auth + Keycloak, jeton de service pour les anonymes, `/api/corpus/*`, routes protégées | connexion / déconnexion avec `lecteur` ; fiche d'une œuvre servie via le proxy |
 | 2 | **Catalogue** : accueil, explore, fiche d'œuvre, auteur, courant, couvertures génératives, `⌘K` | navigation complète sur les 36 éditions |
 | 3 | **Liseuse** : toc, chapitres, notes, modes défilement / pages, réglages « Aa » (locaux) | lire un livre de bout en bout, mobile et bureau |
@@ -310,3 +314,43 @@ démarrage du conteneur.
 - **Annotations** (surlignages, notes personnelles, signets multiples) : hors
   du périmètre demandé ; le modèle d'ancres les permet sans changer le schéma
   existant (table `annotations` à part).
+
+## 12. État de la réalisation
+
+### Ce qui s'écarte du plan
+
+| Plan | Réalisé | Pourquoi |
+| --- | --- | --- |
+| Écritures hors ligne par *Background Sync*, file vidée à `online` | Une seule file côté client (Dexie, `lib/offline/outbox.ts`), vidée au retour du réseau, au retour sur l'onglet et au démarrage ; le service worker ne touche pas à `/api/me` | Background Sync n'existe ni dans Safari ni dans Firefox : une file unique évite deux mécanismes concurrents qui rejoueraient les mêmes écritures |
+| Thème Keycloak avec Keycloakify | Thème CSS `keycloak/themes/thot` héritant de `keycloak.v2` | Même rendu (couleurs, typographie, logo, clair/sombre) sans chaîne Maven ni build de JAR ; Keycloakify reste possible si l'on veut changer la structure des pages |
+| `sendBeacon` à la fermeture | `fetch(..., { keepalive: true })` | `sendBeacon` ne fait que des POST ; l'API de progression est un PUT idempotent |
+| Défilement « virtualisé » | Chapitre rendu en entier, chapitres voisins préchargés | Les chapitres font au plus quelques centaines de paragraphes ; à reprendre si un livre a des chapitres de plusieurs milliers de segments |
+| Audit Lighthouse « PWA » | Catégorie absente de Lighthouse 12 ; installabilité vérifiée par les tests (manifeste, service worker) | — |
+| `customSession` pour exposer `user_sub` | Champ `sub` du profil Keycloak copié dans `auth.user` à la création du compte ; `/update-user` et les autres routes de modification de compte sont désactivées | Plus simple, aucune requête de plus par session ; les comptes se gèrent dans Keycloak |
+| DOMPurify pour assainir `markup` | Assainisseur sur chaînes (`lib/reader/render.ts`, liste blanche) | Fonctionne au rendu serveur comme dans le navigateur : le premier chapitre arrive avec la page |
+
+### Mesures (Lighthouse 12, mobile simulé, connecté)
+
+| Page | Performance | Accessibilité | Bonnes pratiques | SEO |
+| --- | --- | --- | --- | --- |
+| Liseuse | 87 (LCP 2,1 s) | 100 | 100 | 100 |
+| Accueil, Explorer, fiche, Recherche, Bibliothèque | 71–77 (LCP 3–5 s) | 100 | 96–100 | 90–100 |
+| Réglages | 82 | 100 | 100 | 100 |
+
+La performance des pages de catalogue est limitée par le JavaScript (~640 Ko
+transférés, ~1 s d'exécution en CPU bridé) : pistes, charger à la demande
+la palette ⌘K, dnd-kit et Motion.
+
+### Restent ouverts
+
+- **Lecture anonyme** (§11) : le code la permet, mais les 36 éditions sont
+  `restricted` : un visiteur voit un catalogue vide. Choisir les éditions du
+  domaine public à passer en `access = "open"` dans les `work.toml`.
+- **Alignements** : l'édition française de *L'Esprit souterrain* est une
+  adaptation (≈ 3 % de paragraphes alignés avec l'original) ; la lecture
+  parallèle n'a de sens qu'avec les éditions bien alignées (anglaise : 99 %).
+- Un clic sur « Suite » juste après l'ouverture d'un chapitre est parfois
+  perdu (≈ 1 fois sur 3 en test automatisé, page pourtant hydratée) ; le test
+  réessaie, la cause n'est pas encore trouvée.
+- `GET /v1/works?ids=` (lot) côté API : toujours pas nécessaire, `work_cache`
+  suffit.

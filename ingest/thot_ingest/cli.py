@@ -122,77 +122,69 @@ def extract(
     language_check: Annotated[
         bool, typer.Option(help="Refuse une édition dont la langue ne correspond pas à la fiche.")
     ] = True,
+    overwrite_metadata: Annotated[
+        bool,
+        typer.Option(
+            help="Le work.toml écrase les fiches déjà en base (par défaut, la base est la référence "
+            "et le work.toml ne crée que ce qui manque)."
+        ),
+    ] = False,
+    align: Annotated[
+        bool,
+        typer.Option(
+            help="Aligne ensuite les œuvres touchées sur leur référence (seulement les éditions "
+            "nouvelles, ou toute l'œuvre si la référence a changé)."
+        ),
+    ] = True,
 ) -> None:
     """EPUB -> Postgres (œuvres, éditions, structure, texte, notes, pages) et
-    EPUB -> MinIO. Les éditions inchangées ne sont pas relues, mais leur fiche
-    (droits, éditeur, traducteurs…) est mise à jour."""
-    from thot_core import qdrant as qstore
-    from thot_core import s3
-    from thot_ingest.pipeline.extract import needs_extract, parse_all
-    from thot_ingest.pipeline.index import sync_edition_payload
-    from thot_ingest.store.pg import Store, connect
+    EPUB -> MinIO. Les éditions inchangées ne sont pas relues. Les fiches déjà
+    en base (modifiables dans la console) ne sont pas réécrites, sauf
+    --overwrite-metadata. Les œuvres touchées sont ensuite alignées (--no-align)."""
+    from thot_ingest import jobs
+    from thot_ingest.pipeline.extract import extract_catalog
+    from thot_ingest.store.pg import connect
 
     settings = get_settings()
     catalog = scan(books_dir or settings.books_dir)
     _print_issues(catalog)
     conn = connect(settings.database_url)
-    store = Store(conn)
-    mc = s3.client(settings.minio_endpoint, settings.minio_root_user, settings.minio_root_password)
-    bucket = settings.minio_books_bucket
-    if mc is None:
-        console.print("[yellow]MINIO_ENDPOINT vide : les EPUB ne sont pas envoyés dans MinIO.")
-    else:
-        s3.ensure_bucket(mc, bucket)
+    styles = {"info": "", "warning": "[yellow]", "error": "[red]"}
 
-    work_ids = {w.slug: store.upsert_work(w) for w in catalog.works}
-    todo = [(w, e) for w, e in _items(catalog) if needs_extract(store, e, force)]
-    todo_files = {e.source_file for _, e in todo}
-    unchanged = [e for _, e in _items(catalog) if e.source_file not in todo_files]
-    if unchanged:
-        console.print(f"{len(unchanged)} édition(s) inchangée(s), texte non relu (--force pour le refaire)")
-    for spec in unchanged:
-        state = store.edition_state(spec.source_file)
-        assert state is not None
-        key = None
-        if mc and state.epub_object_key is None:
-            key = s3.put_epub(mc, bucket, spec.path, state.sha256)
-        changed = store.sync_edition(spec, key)
-        if changed:
-            console.print(f"Fiche mise à jour : {spec.source_file} ({', '.join(changed)})")
-        if "access" in changed:
-            # Les droits sont aussi dans le payload Qdrant (filtre de la recherche).
-            sync_edition_payload(conn, qstore.client(settings.qdrant_url, settings.qdrant_api_key), state.id)
+    with jobs.track_cli(settings.database_url, "thot extract", {"force": force}) as job, _progress() as bar:
+        task = bar.add_task("Extraction", total=None, current="")
 
-    ok = failed = 0
-    with _progress() as progress:
-        task = progress.add_task("Extraction", total=len(todo), current="")
-        for r in parse_all(todo, workers, language_check):
-            progress.update(task, advance=1, current=r.spec.source_file)
-            ingestion = store.start_ingestion(r.spec.source_file)
-            error = r.error
-            edition_id = None
-            n_segments = 0
-            if error is None:
-                try:
-                    key = s3.put_epub(mc, bucket, r.spec.path, r.parsed.sha256) if mc else None
-                    saved = store.save_edition(
-                        work_ids[r.work.slug], r.spec, r.parsed, r.work.title, epub_key=key
-                    )
-                    edition_id = saved.id
-                    n_segments = len(r.parsed.text.segments)
-                    if mc and saved.previous_epub_key and saved.previous_epub_key != key:
-                        s3.remove(mc, bucket, saved.previous_epub_key)
-                except Exception as e:  # rapportée dans `ingestions` et à l'écran
-                    error = f"{type(e).__name__}: {e}"
-            store.finish_ingestion(ingestion, edition_id=edition_id, error=error, n_segments=n_segments)
-            if error:
-                failed += 1
-                console.print(f"[red]ÉCHEC[/] {r.spec.source_file} : {error}")
-            else:
-                ok += 1
-    console.print(f"[green]{ok} extraite(s)[/], [red]{failed} en échec[/]")
-    if failed:
-        raise typer.Exit(1)
+        def on_progress(done: int, total: int, current: str) -> None:
+            bar.update(task, completed=done, total=total, current=current)
+            if job:
+                job.progress("extract", done, total, current)
+
+        report = extract_catalog(
+            conn,
+            settings,
+            catalog,
+            workers=workers,
+            force=force,
+            language_check=language_check,
+            overwrite_metadata=overwrite_metadata,
+            job_id=job.id if job else None,
+            log=lambda level, msg: console.print(f"{styles[level]}{msg}"),
+            progress=on_progress,
+        )
+        if job:
+            job.result = {"ok": report.ok, "failed": report.failed, "unchanged": report.unchanged}
+        console.print(f"[green]{report.ok} extraite(s)[/], [red]{report.failed} en échec[/]")
+        if align and report.work_ids:
+            from thot_ingest.pipeline.align import works_to_align
+
+            # Œuvres d'au moins deux éditions parmi celles dont un texte a été écrit
+            works = works_to_align(conn, ids=list(report.work_ids))
+            if works:
+                if job:
+                    job.progress("align", 0, len(works), f"{len(works)} œuvre(s) à aligner", force=True)
+                _align_works(conn, works, force=False, incremental=True)
+        if report.failed:
+            raise typer.Exit(1)
 
 
 # --------------------------------------------------------------------- index
@@ -351,16 +343,24 @@ def align(
     work: Annotated[str | None, typer.Option(help="Slug d'une seule œuvre (auteur/oeuvre).")] = None,
     force: Annotated[bool, typer.Option(help="Réaligne même les œuvres corrigées à la main.")] = False,
 ) -> None:
-    """Aligne les traductions de chaque œuvre disponible en plusieurs éditions."""
-    from thot_ingest.pipeline.align import AlignEncoder, align_work, works_to_align
+    """Réaligne toutes les traductions de chaque œuvre disponible en plusieurs
+    éditions (`thot extract` n'aligne que les éditions nouvelles)."""
+    from thot_ingest.pipeline.align import works_to_align
     from thot_ingest.store.pg import connect
 
-    s = get_settings()
-    conn = connect(s.database_url)
+    conn = connect(get_settings().database_url)
     works = works_to_align(conn, work)
     if not works:
         console.print("Aucune œuvre avec au moins deux éditions extraites.")
         return
+    _align_works(conn, works, force=force, incremental=False)
+
+
+def _align_works(conn, works: list[dict], *, force: bool, incremental: bool) -> None:
+    """Aligne chaque œuvre sur sa référence et affiche la qualité par édition."""
+    from thot_ingest.pipeline.align import AlignEncoder, align_work
+
+    s = get_settings()
     console.print(f"Chargement de {s.align_model}…")
     encoder = AlignEncoder(s.align_model, s.device)
 
@@ -376,10 +376,18 @@ def align(
         table.add_column(col)
     for w in works:
         console.print(f"Alignement de [bold]{w['slug']}[/] ({w['n_editions']} éditions)…")
+        if not w["has_original"]:
+            console.print(
+                f"[yellow]attention[/] {w['slug']} : original absent, alignement sur une "
+                "référence provisoire (l'édition la plus longue)"
+            )
         try:
-            reports = align_work(conn, encoder, w, force)
+            reports = align_work(conn, encoder, w, force, incremental=incremental)
         except RuntimeError as e:
             console.print(f"[yellow]{w['slug']} ignorée : {e}")
+            continue
+        if not reports:
+            console.print("  déjà alignée")
             continue
         for r in reports:
             if r["status"] == "reference":
@@ -401,6 +409,7 @@ def align(
 @app.command()
 def status() -> None:
     """Avancement de chaque étape."""
+    from thot_ingest.pipeline.align import works_without_original
     from thot_ingest.pipeline.index import list_indexes
     from thot_ingest.store.pg import connect
 
@@ -428,6 +437,11 @@ def status() -> None:
         "SELECT status::text AS status, count(*) AS n FROM edition_alignments GROUP BY 1 ORDER BY 1"
     ).fetchall():
         console.print(f"Alignement {r['status']} : {r['n']} édition(s)")
+    for r in works_without_original(conn):
+        console.print(
+            f"[yellow]Original absent[/] : {r['slug']} ({r['n_editions']} éditions, "
+            "alignées sur une référence provisoire)"
+        )
 
 
 # -------------------------------------------------------------------- search
@@ -485,3 +499,72 @@ def search(
             trans = h.translation or "(pas de passage aligné dans cette langue)"
             body += f"\n\n[dim]── {h.translation_language} ──[/]\n{trans[:1500]}"
         console.print(Panel(body, title=title, subtitle=f"score {h.score:.3f}", title_align="left"))
+
+
+# -------------------------------------------------------------------- worker
+@app.command()
+def worker(
+    once: Annotated[bool, typer.Option(help="Traite la file puis s'arrête (sans attendre).")] = False,
+) -> None:
+    """Exécute les tâches de la console (dépôts, retraitements, alignements,
+    corbeille…). Service permanent : `ingest-worker` dans docker compose."""
+    from thot_ingest.worker import main
+
+    main(get_settings(), once=once)
+
+
+# ------------------------------------------------------------------- quality
+@app.command()
+def quality(
+    reparse: Annotated[
+        bool,
+        typer.Option(
+            help="Relit les EPUB de books/ pour les informations de lecture (méthode de structure, "
+            "avertissements, langue détectée) des éditions extraites avant leur enregistrement."
+        ),
+    ] = False,
+    workers: Workers = DEFAULT_WORKERS,
+) -> None:
+    """Recalcule la qualité (mesures, signaux, score) de toutes les éditions."""
+    from collections import Counter
+    from concurrent.futures import ProcessPoolExecutor
+
+    from thot_ingest import jobs
+    from thot_ingest import quality as q
+    from thot_ingest.parse import parse_epub
+    from thot_ingest.store.pg import connect
+    from thot_ingest.text.language import detect_majority
+
+    settings = get_settings()
+    conn = connect(settings.database_url)
+    with (
+        jobs.track_cli(settings.database_url, "thot quality", {"reparse": reparse}) as job,
+        _progress() as bar,
+    ):
+        if reparse:
+            rows = conn.execute("SELECT id, source_file FROM editions WHERE deleted_at IS NULL").fetchall()
+            paths = {r["id"]: settings.books_dir / r["source_file"] for r in rows}
+            paths = {k: p for k, p in paths.items() if p.is_file()}
+            task = bar.add_task("Relecture", total=len(paths), current="")
+            with ProcessPoolExecutor(max_workers=max(1, workers)) as pool:
+                for done, (edition_id, parsed) in enumerate(
+                    zip(paths, pool.map(parse_epub, paths.values()), strict=True), 1
+                ):
+                    q.record_parse(conn, edition_id, parsed, detect_majority(parsed.body_paragraphs()))
+                    bar.update(task, completed=done, current=paths[edition_id].name)
+                    if job:
+                        job.progress("reparse", done, len(paths))
+        task = bar.add_task("Qualité", total=None, current="")
+
+        def on_progress(done: int, total: int) -> None:
+            bar.update(task, completed=done, total=total)
+            if job:
+                job.progress("quality", done, total)
+
+        n = q.compute_all(conn, on_progress=on_progress)
+    counts = Counter(
+        s for r in conn.execute("SELECT signals FROM edition_quality").fetchall() for s in r["signals"]
+    )
+    console.print(f"{n} édition(s) évaluée(s).")
+    for code, count in counts.most_common():
+        console.print(f"  {code} : {count}")

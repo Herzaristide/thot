@@ -521,9 +521,11 @@ Faits (migration `db/migrations/20261002120000_corpus_api.sql` et ingestion) :
 
 ## 10. Hors périmètre de la v1
 
-- Écriture dans le catalogue (fiches, éditions) : passe par `work.toml` et
-  l'ingestion.
-- Administration des index vectoriels : CLI `thot index …`.
+- Création des index vectoriels : CLI `thot index create`.
+
+L'administration du corpus (supervision, dépôts, fiches, structure,
+corbeille, atelier d'alignement) est sous `/v1/admin` (rôle `corpus:admin`,
+`corpus:review` pour l'atelier) : voir `docs/console.md` §9.
 - Toute donnée utilisateur (progression, favoris, collections, surlignages) :
   bases des applications.
 - Recherche fédérée hors du corpus.

@@ -14,7 +14,7 @@ test("téléphone : barre d'onglets et liseuse immersive", async ({ page }) => {
     .getByRole("link", { name: /^(Lire|Reprendre)/ })
     .first()
     .click();
-  const text = page.locator("article.reader-text p[data-seq]").first();
+  const text = page.locator("[data-ready] article.reader-text p[data-seq]").first();
   await expect(text).toBeVisible();
   // L'interface se masque pendant la lecture, un toucher au centre la rend
   await expect(page.getByRole("banner")).toBeHidden({ timeout: 8000 });

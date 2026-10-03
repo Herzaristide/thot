@@ -22,3 +22,22 @@ def detect_language(text: str) -> str | None:
 
 def same_language(declared: str, detected: str | None) -> bool:
     return detected is None or declared.split("-")[0].lower() == detected
+
+
+def detect_majority(paragraphs: list[str]) -> str | None:
+    """Langue majoritaire sur trois extraits (début, milieu, fin du corps) :
+    un seul extrait plein de noms propres trompe parfois la détection."""
+    from collections import Counter
+
+    if not paragraphs:
+        return None
+    votes = []
+    for frac in (0.25, 0.5, 0.75):
+        i = int(len(paragraphs) * frac)
+        sample, j = [], i
+        while j < len(paragraphs) and sum(map(len, sample)) < 3000:
+            sample.append(paragraphs[j])
+            j += 1
+        if lang := detect_language("\n".join(sample)):
+            votes.append(lang)
+    return Counter(votes).most_common(1)[0][0] if votes else None

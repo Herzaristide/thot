@@ -9,7 +9,8 @@ export const quoteSchema = z.object({
 });
 
 export const progressPutSchema = z.object({
-  workId: z.uuid(),
+  /** Édition lue : la position (revision, seq, offset) s'y rapporte. */
+  editionId: z.uuid(),
   revision: z.int().min(1),
   seq: z.int().min(0),
   offset: z.int().min(0).default(0),

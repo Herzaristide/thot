@@ -18,7 +18,7 @@ async function openReader(page: Page) {
     .first()
     .click();
   await page.waitForURL(/\/read\//);
-  await expect(page.locator("article.reader-text p[data-seq]").first()).toBeVisible();
+  await expect(page.locator("[data-ready] article.reader-text p[data-seq]").first()).toBeVisible();
 }
 
 test.describe.configure({ mode: "serial" });
@@ -95,7 +95,12 @@ test("liseuse : réglages, chapitres, table des matières, recherche", async ({ 
 test("liseuse : la progression est reprise", async ({ page }) => {
   await openReader(page);
   // Va au chapitre suivant puis défile
-  await page.getByRole("button", { name: /Suite/ }).click();
+  const first = page.locator("article p[data-seq]").first();
+  const before = await first.getAttribute("data-seq");
+  await expect(async () => {
+    await page.getByRole("button", { name: /Suite/ }).click();
+    await expect(first).not.toHaveAttribute("data-seq", before ?? "", { timeout: 2000 });
+  }).toPass({ timeout: 10_000 });
   // Envoi périodique (toutes les ~5 s)
   const saved = page.waitForResponse(
     (r) => r.url().includes("/api/me/progress/") && r.request().method() === "PUT" && r.ok(),
@@ -149,6 +154,7 @@ test("liseuse : lecture parallèle et changement de traduction", async ({ page }
     .getByRole("link", { name: /Lire|Reprendre/ })
     .click();
   await page.waitForURL(/\/read\//);
+  await page.locator("[data-ready]").waitFor();
   await page.getByRole("button", { name: "Chapitre suivant" }).click();
   await page.getByRole("button", { name: "Langues et traductions" }).click();
   await page.getByRole("menuitem", { name: "Avec Russe" }).click();
@@ -163,6 +169,54 @@ test("liseuse : lecture parallèle et changement de traduction", async ({ page }
   await expect(page.locator("article.reader-text")).toHaveAttribute("lang", "ru");
 });
 
+test("liseuse : lecture parallèle en mode pages", async ({ page }) => {
+  await openWork(page);
+  await page
+    .getByRole("listitem")
+    .filter({ hasText: "Anglais" })
+    .getByRole("link", { name: /Lire|Reprendre/ })
+    .click();
+  await page.waitForURL(/\/read\//);
+  await page.locator("[data-ready]").waitFor();
+  await page.getByRole("button", { name: "Chapitre suivant" }).click();
+  await page.getByRole("button", { name: "Langues et traductions" }).click();
+  await page.getByRole("menuitem", { name: "Avec Russe" }).click();
+  await page.getByRole("button", { name: "Réglages d'affichage" }).click();
+  await page.getByRole("radio", { name: "Pages" }).click();
+  await page.keyboard.press("Escape");
+
+  // Les deux textes sont paginés ensemble
+  await expect(
+    page.locator(".reader-paged [data-parallel-target] p[data-seq]").first(),
+  ).toBeVisible();
+  await expect(page.locator(".reader-paged [data-parallel-target]").first()).toHaveAttribute(
+    "lang",
+    "ru",
+  );
+  // Pagination refaite une fois la traduction chargée : plusieurs pages, on tourne la page
+  // (pages de titre d'une seule page : on avance jusqu'à un vrai chapitre)
+  const indicator = page.getByText(/^\d+ \/ \d+$/);
+  await expect(async () => {
+    if ((await indicator.textContent()) === "1 / 1") await page.keyboard.press("ArrowRight");
+    await expect(indicator).toHaveText(/^1 \/ ([2-9]|\d{2,})$/, { timeout: 2000 });
+  }).toPass({ timeout: 20_000 });
+  await page.keyboard.press("ArrowRight");
+  await expect(indicator).toHaveText(/^2 \/ /);
+
+  // Retour au défilement, sans lecture parallèle, pour les tests suivants
+  await page.getByRole("button", { name: "Réglages d'affichage" }).click();
+  await page.getByRole("radio", { name: "Défilement" }).click();
+  await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: "Langues et traductions" }).click();
+  // Préférences envoyées après ~800 ms : on attend l'envoi avant de fermer la page
+  const saved = page.waitForResponse(
+    (r) => r.url().includes("/api/me/preferences") && r.request().method() === "PUT" && r.ok(),
+  );
+  await page.getByRole("menuitem", { name: "Désactivée" }).click();
+  await expect(page.locator("[data-parallel-target]")).toHaveCount(0);
+  await saved;
+});
+
 test("hors ligne : un livre téléchargé reste lisible", async ({ page, context }) => {
   await openReader(page);
   // Attend que le service worker contrôle la page
@@ -170,13 +224,13 @@ test("hors ligne : un livre téléchargé reste lisible", async ({ page, context
     await navigator.serviceWorker.ready;
   });
   await page.reload();
-  await expect(page.locator("article.reader-text p[data-seq]").first()).toBeVisible();
+  await expect(page.locator("[data-ready] article.reader-text p[data-seq]").first()).toBeVisible();
   await page.getByRole("button", { name: "Télécharger pour lire hors ligne" }).click();
   await expect(page.getByText("Livre disponible hors ligne")).toBeVisible({ timeout: 30_000 });
 
   await context.setOffline(true);
   await page.reload();
-  await expect(page.locator("article.reader-text p[data-seq]").first()).toBeVisible();
+  await expect(page.locator("[data-ready] article.reader-text p[data-seq]").first()).toBeVisible();
   // Un autre chapitre, jamais ouvert, vient d'IndexedDB
   await page.getByRole("button", { name: /Suite/ }).click();
   await expect(page.locator("article.reader-text p[data-seq]").first()).toBeVisible();

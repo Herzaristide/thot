@@ -1,5 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { makeQuote, progressOf } from "@/lib/reader/anchor";
+import { approxSeq, makeQuote, progressOf } from "@/lib/reader/anchor";
+
+describe("approxSeq", () => {
+  it("ramène un pourcentage au segment correspondant", () => {
+    expect(approxSeq(0, 200)).toBe(0);
+    expect(approxSeq(0.5, 200)).toBe(100);
+  });
+
+  it("reste dans l'édition", () => {
+    expect(approxSeq(1, 200)).toBe(199);
+    expect(approxSeq(-0.1, 200)).toBe(0);
+  });
+});
 
 describe("makeQuote", () => {
   const text =

@@ -32,12 +32,17 @@ export const preferences = pgTable("preferences", {
 
 export type Quote = { exact: string; prefix: string; suffix: string };
 
+/**
+ * Progression par œuvre, quelle que soit la traduction : `edition_id` est la
+ * dernière édition lue, à laquelle se rapporte la position (revision, seq,
+ * offset). Ouvrir une autre édition convertit la position par l'alignement.
+ */
 export const readingProgress = pgTable(
   "reading_progress",
   {
     userSub: text("user_sub").notNull(),
-    editionId: uuid("edition_id").notNull(),
     workId: uuid("work_id").notNull(),
+    editionId: uuid("edition_id").notNull(),
     revision: integer("revision").notNull(),
     seq: integer("seq").notNull(),
     offset: integer("offset").notNull().default(0),
@@ -50,7 +55,7 @@ export const readingProgress = pgTable(
     finishedAt: timestamp("finished_at", tz),
   },
   (t) => [
-    primaryKey({ columns: [t.userSub, t.editionId] }),
+    primaryKey({ columns: [t.userSub, t.workId] }),
     index("reading_progress_recent").on(t.userSub, t.updatedAt.desc()),
     index("reading_progress_edition").on(t.editionId),
   ],

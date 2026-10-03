@@ -38,7 +38,7 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "tsx e2e/prepare-db.ts && pnpm db:migrate && pnpm start",
+    command: "tsx e2e/prepare-db.ts && pnpm db:migrate && pnpm start:standalone",
     url: "http://localhost:3000/manifest.webmanifest",
     reuseExistingServer: false,
     timeout: 60_000,

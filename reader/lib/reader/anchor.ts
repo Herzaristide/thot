@@ -17,6 +17,11 @@ export function makeQuote(text: string, offset: number) {
   };
 }
 
+/** Repli sans alignement : le segment situé au même pourcentage d'une édition. */
+export function approxSeq(progress: number, totalSegments: number) {
+  return Math.max(0, Math.min(totalSegments - 1, Math.floor(progress * totalSegments)));
+}
+
 /** Avancement (0..1) d'une position, en caractères. */
 export function progressOf(seg: Pick<Segment, "char_start">, offset: number, charLength: number) {
   if (charLength <= 0) return 0;

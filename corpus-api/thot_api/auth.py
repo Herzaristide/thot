@@ -84,7 +84,9 @@ class TokenVerifier:
 
     @cached_property
     def jwks(self) -> jwt.PyJWKClient:
-        with urllib.request.urlopen(f"{self.discovery_url}/.well-known/openid-configuration", timeout=10) as r:
+        with urllib.request.urlopen(
+            f"{self.discovery_url}/.well-known/openid-configuration", timeout=10
+        ) as r:
             jwks_uri = json.load(r)["jwks_uri"]
         return jwt.PyJWKClient(jwks_uri, cache_keys=True, lifespan=3600)
 
@@ -147,3 +149,4 @@ def require(role: str, *, user: bool = False):
 
 Reader = Annotated[Principal, Depends(require(READ))]
 Reviewer = Annotated[Principal, Depends(require(REVIEW, user=True))]
+Admin = Annotated[Principal, Depends(require(ADMIN))]

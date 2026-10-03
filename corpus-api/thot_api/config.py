@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     minio_root_user: str = "thot"
     minio_root_password: str = "change-me"
     minio_books_bucket: str = "books"
+    # Dépôts de la console en attente du worker (docs/console.md §4).
+    minio_inbox_bucket: str = "inbox"
+    # Taille maximale d'un EPUB déposé (octets).
+    upload_max_bytes: int = 100 * 1024 * 1024
 
     # Keycloak : émetteur des jetons (URL du realm) et audience attendue.
     oidc_issuer: str = "http://localhost:8080/realms/thot"

@@ -202,6 +202,15 @@ def load_work(work_dir: Path, books_dir: Path) -> tuple[WorkSpec | None, list[Ca
     originals = [e for e in work.editions if e.original]
     if len(originals) > 1:
         issues.append(CatalogIssue(manifest_path, "plusieurs éditions marquées original = true"))
+    if not originals and len(work.editions) >= 2:
+        issues.append(
+            CatalogIssue(
+                manifest_path,
+                "aucune édition marquée original = true : les traductions s'alignent sur une "
+                "référence provisoire (l'édition la plus longue), à refaire quand l'original arrivera",
+                fatal=False,
+            )
+        )
     if (
         originals
         and work.original_language

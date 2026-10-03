@@ -65,3 +65,48 @@ describe("segmentHtml", () => {
     ).toBe("un <mark>deux</mark> trois");
   });
 });
+
+describe("segmentHtml (assainissement sans DOM)", () => {
+  it("décode les entités pour compter les positions, puis ré-échappe", () => {
+    const html = segmentHtml(
+      seg({
+        text: "A & B",
+        markup: "A &amp; <i>B</i>",
+        notes: [{ offset: 3, label: "2", note_id: "n", origin: "author" }],
+      }),
+      { showPages: false },
+    );
+    expect(html.startsWith("A &amp;")).toBe(true);
+    expect(html).toContain('&amp;<sup class="note-ref">');
+  });
+
+  it("retire le contenu des balises dangereuses et referme les balises ouvertes", () => {
+    expect(
+      segmentHtml(seg({ markup: "a<style>p{}</style><em>b<strong>c" }), { showPages: false }),
+    ).toBe("a<em>b<strong>c</strong></em>");
+    expect(
+      segmentHtml(seg({ markup: '<span lang="ru" style="x" onclick="y">да</span>' }), {
+        showPages: false,
+      }),
+    ).toBe('<span lang="ru">да</span>');
+  });
+
+  it("surligne à travers une balise sans casser l'imbrication", () => {
+    expect(
+      segmentHtml(seg({ markup: "un <em>deux</em> trois" }), {
+        showPages: false,
+        highlight: [3, 13],
+      }),
+    ).toBe("un <em><mark>deux</mark></em><mark> trois</mark>");
+  });
+
+  it("place un appel en fin de segment", () => {
+    const html = segmentHtml(
+      seg({ text: "fin", notes: [{ offset: 3, label: "9", note_id: "z", origin: "unknown" }] }),
+      {
+        showPages: false,
+      },
+    );
+    expect(html).toMatch(/^fin<sup class="note-ref">/);
+  });
+});

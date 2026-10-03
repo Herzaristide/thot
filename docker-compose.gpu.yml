@@ -5,9 +5,12 @@
 # Sur NixOS : `hardware.nvidia-container-toolkit.enable = true;`
 #
 #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml run --rm ingest index run <collection>
-#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile api up -d api
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 services:
   ingest:
+    devices:
+      - nvidia.com/gpu=all
+  ingest-worker:
     devices:
       - nvidia.com/gpu=all
   api:

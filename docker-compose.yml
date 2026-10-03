@@ -53,7 +53,7 @@ services:
       - sh
       - -c
       - |
-        for db in keycloak reader; do
+        for db in keycloak reader console; do
           psql -tAc "SELECT 1 FROM pg_database WHERE datname = '$$db'" | grep -q 1 \
             || psql -c "CREATE DATABASE $$db"
         done
@@ -85,6 +85,8 @@ services:
       # Valeurs injectées dans keycloak/import/thot-realm.json
       THOT_READER_URL: ${READER_URL:-http://localhost:3000}
       THOT_READER_CLIENT_SECRET: ${READER_CLIENT_SECRET:-dev-reader-secret}
+      THOT_CONSOLE_URL: ${CONSOLE_URL:-http://localhost:3001}
+      THOT_CONSOLE_CLIENT_SECRET: ${CONSOLE_CLIENT_SECRET:-dev-console-secret}
       THOT_DEV_USER_PASSWORD: ${KEYCLOAK_DEV_USER_PASSWORD:-lecteur}
     ports:
       - "${KEYCLOAK_PORT:-8080}:8080"
@@ -194,14 +196,52 @@ services:
       # Modèles Hugging Face téléchargés une seule fois
       - hf_cache:/cache/huggingface
 
-  # Corpus API (lecture du corpus pour les applications) :
-  #   docker compose --profile api up -d api      → http://localhost:8000/v1/docs
+  # Worker de la console d'administration (docs/console.md §3) : exécute la
+  # file `jobs` (dépôts, retraitements, alignements, corbeille). Permanent,
+  # garde les modèles en mémoire. Sur CPU par défaut ; GPU (conseillé) :
+  # -f docker-compose.gpu.yml.
+  ingest-worker:
+    image: thot-ingest
+    restart: unless-stopped
+    command: ["worker"]
+    stop_grace_period: 2m
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-thot}:${POSTGRES_PASSWORD:-thot}@postgres:5432/${POSTGRES_DB:-thot}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-chunks}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}
+      VECTOR_SIZE: ${VECTOR_SIZE:-1024}
+      ALIGN_MODEL: ${ALIGN_MODEL:-sentence-transformers/LaBSE}
+      EMBED_BATCH_SIZE: ${EMBED_BATCH_SIZE:-32}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-thot}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me}
+      MINIO_BOOKS_BUCKET: ${MINIO_BOOKS_BUCKET:-books}
+      MINIO_INBOX_BUCKET: ${MINIO_INBOX_BUCKET:-inbox}
+      TRASH_DAYS: ${TRASH_DAYS:-30}
+      IDENTIFY_AUTO: ${IDENTIFY_AUTO:-false}
+      WIKIDATA_ENABLED: ${WIKIDATA_ENABLED:-true}
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./books:/books:ro
+      - hf_cache:/cache/huggingface
+
+  # Corpus API (lecture du corpus pour les applications) → http://localhost:8000/v1/docs
+  # Sur CPU par défaut ; GPU : ajouter -f docker-compose.gpu.yml (voir ce fichier).
   api:
     build:
       context: .
       dockerfile: corpus-api/Dockerfile
     image: thot-api
-    profiles: ["api"]
     restart: unless-stopped
     depends_on:
       migrate:
@@ -239,14 +279,12 @@ services:
       start_period: 120s
       retries: 3
 
-  # Liseuse (Next.js) et sa synchronisation avec le corpus :
-  #   docker compose --profile api --profile reader up -d   → http://localhost:3000
+  # Liseuse (Next.js) → http://localhost:3000
   # Migrations de la base `reader` appliquées au démarrage du conteneur.
   reader:
     build:
       context: ./reader
     image: thot-reader
-    profiles: ["reader"]
     restart: unless-stopped
     depends_on:
       databases:
@@ -255,7 +293,6 @@ services:
         condition: service_healthy
       api:
         condition: service_healthy
-        required: false
     ports:
       - "${READER_PORT:-3000}:3000"
     environment: &reader-env
@@ -278,7 +315,6 @@ services:
   # Suit /v1/changes : recale les progressions quand un texte est remplacé
   reader-worker:
     image: thot-reader
-    profiles: ["reader"]
     restart: unless-stopped
     depends_on:
       reader:
@@ -287,6 +323,39 @@ services:
       <<: *reader-env
       WORKER_INTERVAL: ${READER_WORKER_INTERVAL:-60}
     command: ["node", "worker.mjs"]
+
+  # Console d'administration (docs/console.md) → http://localhost:3001
+  # Réservée aux rôles corpus:admin / corpus:review (client Keycloak thot-console).
+  console:
+    build:
+      context: ./console
+    image: thot-console
+    restart: unless-stopped
+    depends_on:
+      databases:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    ports:
+      - "${CONSOLE_PORT:-3001}:3001"
+    environment:
+      BETTER_AUTH_URL: ${CONSOLE_URL:-http://localhost:3001}
+      BETTER_AUTH_SECRET: ${CONSOLE_AUTH_SECRET:-dev-console-secret-change-me-dev-console}
+      CONSOLE_DATABASE_URL: postgresql://${POSTGRES_USER:-thot}:${POSTGRES_PASSWORD:-thot}@postgres:5432/console
+      OIDC_ISSUER: ${OIDC_ISSUER:-http://localhost:8080/realms/thot}
+      OIDC_DISCOVERY_URL: http://keycloak:8080/realms/thot
+      CONSOLE_CLIENT_ID: thot-console
+      CONSOLE_CLIENT_SECRET: ${CONSOLE_CLIENT_SECRET:-dev-console-secret}
+      CORPUS_API_URL: ${CORPUS_API_URL:-http://api:8000}
+      READER_URL: ${READER_URL:-http://localhost:3000}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3001/icon.svg"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
 
 volumes:
   postgres_data:

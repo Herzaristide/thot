@@ -40,6 +40,13 @@ class ParsedEdition:
             i += 1
         return "\n".join(sample)
 
+    def body_paragraphs(self) -> list[str]:
+        return [
+            s.text
+            for s in self.text.segments
+            if s.kind == "paragraph" and self.text.matter.get(s.section_id) == "body"
+        ]
+
     def stats(self) -> dict[str, int]:
         body = [s for s in self.text.segments if self.text.matter.get(s.section_id) == "body"]
         return {

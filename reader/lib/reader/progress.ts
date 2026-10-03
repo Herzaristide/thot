@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef } from "react";
 import { localDb, type ProgressBody } from "@/lib/offline/db";
 import { send } from "@/lib/offline/outbox";
-import { makeQuote, progressOf } from "./anchor";
+import { approxSeq, makeQuote, progressOf } from "./anchor";
 
 export type ReadingPosition = {
   seq: number;
@@ -36,19 +36,19 @@ export function useProgressSync(opts: {
       const body = latest.current;
       if (!signedIn || !body || body.updatedAt === sentAt.current) return;
       sentAt.current = body.updatedAt;
-      await send("PUT", `/api/me/progress/${editionId}`, body, {
-        key: `progress:${editionId}`,
+      await send("PUT", `/api/me/progress/${workId}`, body, {
+        key: `progress:${workId}`,
         keepalive,
       });
     },
-    [editionId, signedIn],
+    [workId, signedIn],
   );
 
   const report = useCallback(
     (pos: ReadingPosition) => {
       const progress = progressOf({ char_start: pos.charStart }, pos.offset, charLength);
       const body: ProgressBody = {
-        workId,
+        editionId,
         revision,
         seq: pos.seq,
         offset: pos.offset,
@@ -60,7 +60,7 @@ export function useProgressSync(opts: {
         finishedAt: progress >= 0.995 ? new Date().toISOString() : null,
       };
       latest.current = body;
-      void localDb()?.progress.put({ editionId, body });
+      void localDb()?.workProgress.put({ workId, body });
     },
     [charLength, editionId, revision, workId],
   );
@@ -85,7 +85,30 @@ export function useProgressSync(opts: {
   return { report, flush };
 }
 
-/** Position locale la plus récente (lecture hors ligne, ou visiteur). */
-export async function localProgress(editionId: string): Promise<ProgressBody | null> {
-  return (await localDb()?.progress.get(editionId))?.body ?? null;
+/**
+ * Dernière position gardée sur cet appareil pour l'œuvre (visiteur), ramenée
+ * dans `edition` : telle quelle si c'est la même édition, sinon par
+ * l'alignement (`counterpart`), à défaut au même pourcentage.
+ */
+export async function localPosition(
+  workId: string,
+  edition: { id: string; revision: number; totalSegments: number },
+): Promise<{ seq: number; offset: number } | null> {
+  const p = (await localDb()?.workProgress.get(workId))?.body;
+  if (!p) return null;
+  if (p.editionId === edition.id) {
+    return p.revision === edition.revision ? { seq: p.seq, offset: p.offset } : null;
+  }
+  try {
+    const res = await fetch(
+      `/api/corpus/v1/editions/${p.editionId}/counterpart?seq=${p.seq}&target=${edition.id}`,
+    );
+    if (res.ok) {
+      const c = (await res.json()) as { seq_start: number };
+      return { seq: c.seq_start, offset: 0 };
+    }
+  } catch {
+    // Hors ligne : repli sur le pourcentage
+  }
+  return { seq: approxSeq(p.progress, edition.totalSegments), offset: 0 };
 }

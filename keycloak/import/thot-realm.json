@@ -91,6 +91,43 @@
           }
         }
       ]
+    },
+    {
+      "clientId": "thot-console",
+      "name": "Thot — console d'administration",
+      "description": "Application Next.js (BFF) : supervision, dépôts, fiches et alignements (rôles corpus:admin / corpus:review). Pas de compte de service : chaque action est faite au nom d'une personne.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${THOT_CONSOLE_CLIENT_SECRET:dev-console-secret}",
+      "rootUrl": "${THOT_CONSOLE_URL:http://localhost:3001}",
+      "baseUrl": "/",
+      "redirectUris": ["${THOT_CONSOLE_URL:http://localhost:3001}/*"],
+      "webOrigins": ["+"],
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "frontchannelLogout": true,
+      "fullScopeAllowed": true,
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "${THOT_CONSOLE_URL:http://localhost:3001}/*"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience corpus-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "corpus-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
     }
   ],
   "users": [

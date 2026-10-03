@@ -386,7 +386,9 @@ async def similar(body: SimilarRequest, request: Request, conn: Conn, principal:
     index = await engine.active()
     source = await (
         await conn.execute(
-            "SELECT e.work_id, e.access::text AS access FROM editions e WHERE e.id = %s", (body.edition_id,)
+            "SELECT e.work_id, e.access::text AS access FROM editions e "
+            "WHERE e.id = %s AND e.deleted_at IS NULL",
+            (body.edition_id,),
         )
     ).fetchone()
     if source is None or not principal.can_see(source["access"]):

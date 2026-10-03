@@ -220,7 +220,6 @@
   column-fill: auto;
   column-gap: var(--reader-gap, 4rem);
   height: 100%;
-  overflow: hidden;
 }
 
 .scrollbar-none {

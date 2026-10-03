@@ -7,15 +7,15 @@ le processus principal (pas de concurrence sur les personnes / œuvres).
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from thot_ingest.catalog import EditionSpec, WorkSpec
 from thot_ingest.epub.container import sha256_file
 from thot_ingest.parse import ParsedEdition, parse_epub
-from thot_ingest.text.language import detect_language, same_language
+from thot_ingest.text.language import detect_majority, same_language
 
 
 @dataclass
@@ -45,7 +45,7 @@ def parse_all(
             except Exception as e:  # noqa: BLE001 - toute erreur de lecture est rapportée
                 yield EditionResult(work, spec, None, f"{type(e).__name__}: {e}")
                 continue
-            detected = detect_language(parsed.body_sample())
+            detected = detect_majority(parsed.body_paragraphs())
             error = None
             if check_language and not same_language(spec.language, detected):
                 error = (
@@ -116,3 +116,97 @@ def needs_extract(store, spec: EditionSpec, force: bool) -> bool:
         return True
     state = store.edition_state(spec.source_file)
     return not (state and state.has_text and state.sha256 == sha256_file(spec.path))
+
+
+# ------------------------------------------------------------ extraction en lot
+@dataclass
+class ExtractReport:
+    ok: int = 0
+    failed: int = 0
+    unchanged: int = 0
+    edition_ids: list = field(default_factory=list)  # éditions dont le texte a été (re)écrit
+    work_ids: set = field(default_factory=set)  # œuvres concernées (à réaligner)
+
+
+def extract_catalog(
+    conn,
+    settings,
+    catalog,
+    *,
+    workers: int,
+    force: bool = False,
+    language_check: bool = True,
+    overwrite_metadata: bool = False,
+    job_id=None,
+    log: Callable[[str, str], None] = lambda level, msg: None,
+    progress: Callable[[int, int, str], None] = lambda done, total, current: None,
+    check_cancel: Callable[[], None] = lambda: None,
+) -> ExtractReport:
+    """books/ (catalogue déjà lu) -> Postgres + MinIO, puis qualité des
+    éditions écrites. `log(level, message)` avec level ∈ {info, warning, error}."""
+    from thot_core import qdrant as qstore
+    from thot_core import s3
+    from thot_ingest import quality
+    from thot_ingest.pipeline.index import sync_edition_payload
+    from thot_ingest.store.pg import Store
+
+    store = Store(conn, overwrite_metadata=overwrite_metadata)
+    mc = s3.client(settings.minio_endpoint, settings.minio_root_user, settings.minio_root_password)
+    bucket = settings.minio_books_bucket
+    if mc is None:
+        log("warning", "MINIO_ENDPOINT vide : les EPUB ne sont pas envoyés dans MinIO.")
+    else:
+        s3.ensure_bucket(mc, bucket)
+
+    items = [(w, e) for w in catalog.works for e in w.editions]
+    work_ids = {w.slug: store.upsert_work(w) for w in catalog.works}
+    todo = [(w, e) for w, e in items if needs_extract(store, e, force)]
+    todo_files = {e.source_file for _, e in todo}
+    unchanged = [e for _, e in items if e.source_file not in todo_files]
+    report = ExtractReport(unchanged=len(unchanged))
+    if unchanged:
+        log("info", f"{len(unchanged)} édition(s) inchangée(s), texte non relu (--force pour le refaire)")
+    for spec in unchanged:
+        state = store.edition_state(spec.source_file)
+        assert state is not None
+        key = None
+        if mc and state.epub_object_key is None:
+            key = s3.put_epub(mc, bucket, spec.path, state.sha256)
+        changed = store.sync_edition(spec, key)
+        if changed:
+            log("info", f"Fiche mise à jour : {spec.source_file} ({', '.join(changed)})")
+        if "access" in changed:
+            # Les droits sont aussi dans le payload Qdrant (filtre de la recherche).
+            sync_edition_payload(conn, qstore.client(settings.qdrant_url, settings.qdrant_api_key), state.id)
+
+    progress(0, len(todo), "")
+    for done, r in enumerate(parse_all(todo, workers, language_check), 1):
+        check_cancel()
+        ingestion = store.start_ingestion(r.spec.source_file, stage="extract", job_id=job_id)
+        error = r.error
+        edition_id = None
+        n_segments = 0
+        if error is None:
+            try:
+                key = s3.put_epub(mc, bucket, r.spec.path, r.parsed.sha256) if mc else None
+                saved = store.save_edition(
+                    work_ids[r.work.slug], r.spec, r.parsed, r.work.title, epub_key=key
+                )
+                edition_id = saved.id
+                n_segments = len(r.parsed.text.segments)
+                if mc and saved.previous_epub_key and saved.previous_epub_key != key:
+                    s3.remove(mc, bucket, saved.previous_epub_key)
+                quality.record_parse(conn, edition_id, r.parsed, r.detected_language)
+                quality.compute(conn, edition_id)
+            except Exception as e:  # rapportée dans `ingestions` et au journal
+                error = f"{type(e).__name__}: {e}"
+        store.finish_ingestion(ingestion, edition_id=edition_id, error=error, n_segments=n_segments)
+        if error:
+            report.failed += 1
+            log("error", f"ÉCHEC {r.spec.source_file} : {error}")
+        else:
+            report.ok += 1
+            report.edition_ids.append(edition_id)
+            report.work_ids.add(work_ids[r.work.slug])
+        progress(done, len(todo), r.spec.source_file)
+    return report

@@ -32,6 +32,20 @@ class Settings(BaseSettings):
     minio_root_user: str = "thot"
     minio_root_password: str = "change-me"
     minio_books_bucket: str = "books"
+    # Dépôts de la console en attente de traitement (objets inbox/<sha256>.epub).
+    minio_inbox_bucket: str = "inbox"
+
+    # Corbeille : une édition supprimée dans la console est purgée après ce délai.
+    trash_days: int = 30
+
+    # Classement des dépôts (docs/console.md §4) : False = toute édition
+    # déposée attend la validation d'un admin, même quand les indices concordent.
+    identify_auto: bool = False
+    # Score minimal (0–1) pour rattacher automatiquement à une œuvre existante.
+    identify_threshold: float = 0.85
+    # Interroger Wikidata quand l'auteur ou le titre est inconnu en base.
+    wikidata_enabled: bool = True
+    wikidata_user_agent: str = "thot/0.1 (https://github.com/Herzaristide/thot)"
 
     @field_validator("books_dir")
     @classmethod

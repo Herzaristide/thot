@@ -8,6 +8,7 @@ import { corpus } from "@/lib/api/server";
 import type { SegmentRange } from "@/lib/api/types";
 import { getUserSub } from "@/lib/auth";
 import { authorsLabel } from "@/lib/format";
+import { approxSeq } from "@/lib/reader/anchor";
 import type { RangeData } from "@/lib/reader/data";
 import { buildUnits, firstBodyUnit, unitOf } from "@/lib/reader/units";
 import { progressFor } from "@/lib/reader-data";
@@ -60,16 +61,31 @@ export default async function ReadPage({ params, searchParams }: Props) {
     api.GET("/v1/works/{work_id}", {
       params: { path: { work_id: edition.work.id }, query: { lang: "fr" } },
     }),
-    sub ? progressFor(sub, [editionId]) : Promise.resolve([]),
+    sub ? progressFor(sub, edition.work.id) : Promise.resolve(null),
   ]);
   if (!toc.data || !work.data) throw new Error("Table des matières indisponible");
 
   // Position de départ : ?seq= (recherche, changement de traduction), sinon la progression
+  // de l'œuvre, quelle que soit l'édition où elle a été enregistrée
   let start: StartPosition | null = null;
   const seqParam = Number(Array.isArray(sp.seq) ? sp.seq[0] : sp.seq);
-  const saved = progress[0];
+  const saved = progress;
   if (Number.isInteger(seqParam) && seqParam >= 0) {
     start = { seq: seqParam, offset: 0, highlight: true };
+  } else if (saved && saved.editionId !== editionId) {
+    // Lue dans une autre traduction : passage correspondant par l'alignement,
+    // à défaut le même pourcentage du texte
+    const { data } = await api.GET("/v1/editions/{edition_id}/counterpart", {
+      params: {
+        path: { edition_id: saved.editionId },
+        query: { seq: saved.seq, target: editionId },
+      },
+    });
+    start = {
+      seq: data?.seq_start ?? approxSeq(saved.progress, edition.n_segments),
+      offset: 0,
+      highlight: false,
+    };
   } else if (saved) {
     start = { seq: saved.seq, offset: saved.offset, highlight: false };
     // Texte remplacé depuis : on recale l'ancre dans la nouvelle révision

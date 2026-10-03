@@ -10,7 +10,7 @@ import { Segments } from "./segments";
 /**
  * Lecture parallèle d'une unité : paires de groupes de segments (relations
  * n-n) issues de l'alignement. Côte à côte sur grand écran, en alternance
- * (original puis traduction) sur téléphone.
+ * (original puis traduction) sur téléphone ; en défilement comme en pages.
  */
 export function ParallelView({
   editionId,

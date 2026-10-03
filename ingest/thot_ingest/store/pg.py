@@ -23,10 +23,14 @@ def emit(
     work_id: uuid.UUID | None = None,
     edition_id: uuid.UUID | None = None,
     data: dict | None = None,
+    actor: str | None = None,
 ) -> None:
     """Journalise un changement du corpus (flux /v1/changes de l'API). À
-    appeler dans la transaction de la modification."""
-    conn.execute("SELECT corpus_emit(%s, %s, %s, %s)", (type_, work_id, edition_id, Jsonb(data or {})))
+    appeler dans la transaction de la modification. `actor` : `sub` Keycloak
+    de l'auteur, 'cli' pour la ligne de commande."""
+    conn.execute(
+        "SELECT corpus_emit(%s, %s, %s, %s, %s)", (type_, work_id, edition_id, Jsonb(data or {}), actor)
+    )
 
 
 class DuplicateFileError(Exception):
@@ -48,8 +52,13 @@ class SavedEdition:
 
 
 class Store:
-    def __init__(self, conn: psycopg.Connection) -> None:
+    """`overwrite_metadata` : la base est la référence des fiches (modifiées
+    dans la console) ; par défaut, un work.toml ne fait que créer ce qui
+    manque. True = ancien comportement (le work.toml écrase la fiche)."""
+
+    def __init__(self, conn: psycopg.Connection, overwrite_metadata: bool = False) -> None:
         self.conn = conn
+        self.overwrite_metadata = overwrite_metadata
 
     # ------------------------------------------------------------ personnes
     def person_id(self, name: str) -> uuid.UUID:
@@ -80,6 +89,10 @@ class Store:
     def upsert_work(self, work: WorkSpec) -> uuid.UUID:
         with self.conn.transaction():
             before = self._work_snapshot(work.slug)
+            if before is not None and not self.overwrite_metadata:
+                return self.conn.execute("SELECT id FROM works WHERE slug = %s", (work.slug,)).fetchone()[
+                    "id"
+                ]
             work_id = self.conn.execute(
                 """
                 INSERT INTO works (slug, title, original_language, first_published_year, wikidata_id)
@@ -176,6 +189,14 @@ class Store:
                 "SELECT id, work_id FROM editions WHERE source_file = %s", (spec.source_file,)
             ).fetchone()
             before = self._edition_snapshot(row["id"])
+            if not self.overwrite_metadata:
+                # La fiche vit en base : on ne rattrape que le stockage de l'EPUB.
+                if epub_key and before["epub_object_key"] is None:
+                    self.conn.execute(
+                        "UPDATE editions SET epub_object_key = %s WHERE id = %s", (epub_key, row["id"])
+                    )
+                    return ["epub_object_key"]
+                return []
             self.conn.execute(
                 """
                 UPDATE editions SET title = coalesce(%s, title), is_original = %s, publisher = %s,
@@ -222,36 +243,47 @@ class Store:
                 """
                 INSERT INTO editions (work_id, sha256, title, language, is_original, publisher,
                                       year, source_file, access, epub_object_key)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%(work_id)s, %(sha256)s, %(title)s, %(language)s, %(original)s, %(publisher)s,
+                        %(year)s, %(source_file)s, %(access)s, %(epub_key)s)
                 ON CONFLICT (source_file) DO UPDATE SET
-                    work_id = EXCLUDED.work_id, sha256 = EXCLUDED.sha256, title = EXCLUDED.title,
-                    language = EXCLUDED.language, is_original = EXCLUDED.is_original,
-                    publisher = EXCLUDED.publisher, year = EXCLUDED.year, access = EXCLUDED.access,
+                    sha256 = EXCLUDED.sha256,
                     epub_object_key = EXCLUDED.epub_object_key,
-                    revision = editions.revision + 1
-                RETURNING id, revision
+                    revision = editions.revision + 1,
+                    -- Fiche : celle de la base, sauf --overwrite-metadata.
+                    work_id = CASE WHEN %(ow)s THEN EXCLUDED.work_id ELSE editions.work_id END,
+                    title = CASE WHEN %(ow)s THEN EXCLUDED.title ELSE editions.title END,
+                    language = CASE WHEN %(ow)s THEN EXCLUDED.language ELSE editions.language END,
+                    is_original = CASE WHEN %(ow)s THEN EXCLUDED.is_original ELSE editions.is_original END,
+                    publisher = CASE WHEN %(ow)s THEN EXCLUDED.publisher ELSE editions.publisher END,
+                    year = CASE WHEN %(ow)s THEN EXCLUDED.year ELSE editions.year END,
+                    access = CASE WHEN %(ow)s THEN EXCLUDED.access ELSE editions.access END
+                RETURNING id, revision, work_id
                 """,
-                (
-                    work_id,
-                    parsed.sha256,
-                    title,
-                    spec.language,
-                    spec.original,
-                    spec.publisher,
-                    spec.year,
-                    spec.source_file,
-                    spec.access,
-                    epub_key,
-                ),
+                {
+                    "work_id": work_id,
+                    "sha256": parsed.sha256,
+                    "title": title,
+                    "language": spec.language,
+                    "original": spec.original,
+                    "publisher": spec.publisher,
+                    "year": spec.year,
+                    "source_file": spec.source_file,
+                    "access": spec.access,
+                    "epub_key": epub_key,
+                    "ow": self.overwrite_metadata or not existing,
+                },
             ).fetchone()
             edition_id = edition["id"]
+            # L'édition a pu être déplacée vers une autre œuvre dans la console.
+            work_id = edition["work_id"]
 
-            self.conn.execute(
-                "INSERT INTO work_titles (work_id, language, title) VALUES (%s, %s, %s) "
-                "ON CONFLICT DO NOTHING",
-                (work_id, spec.language, title),
-            )
-            self._set_translators(edition_id, spec.translators)
+            if self.overwrite_metadata or not existing:
+                self.conn.execute(
+                    "INSERT INTO work_titles (work_id, language, title) VALUES (%s, %s, %s) "
+                    "ON CONFLICT DO NOTHING",
+                    (work_id, spec.language, title),
+                )
+                self._set_translators(edition_id, spec.translators)
             self._copy_text(edition_id, parsed)
             if existing:
                 emit(
@@ -338,12 +370,20 @@ class Store:
 
     # ----------------------------------------------------------- ingestions
     def start_ingestion(
-        self, source_file: str, edition_id: uuid.UUID | None = None, index_id: uuid.UUID | None = None
+        self,
+        source_file: str,
+        edition_id: uuid.UUID | None = None,
+        index_id: uuid.UUID | None = None,
+        *,
+        stage: str | None = None,
+        job_id: uuid.UUID | None = None,
     ) -> uuid.UUID:
+        if stage is None:
+            stage = "index" if index_id else "extract"
         return self.conn.execute(
-            "INSERT INTO ingestions (source_file, edition_id, index_id, status) "
-            "VALUES (%s, %s, %s, 'running') RETURNING id",
-            (source_file, edition_id, index_id),
+            "INSERT INTO ingestions (source_file, edition_id, index_id, status, stage, job_id) "
+            "VALUES (%s, %s, %s, 'running', %s, %s) RETURNING id",
+            (source_file, edition_id, index_id, stage, job_id),
         ).fetchone()["id"]
 
     def finish_ingestion(
